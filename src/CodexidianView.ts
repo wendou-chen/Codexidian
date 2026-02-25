@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, Menu, normalizePath, Notice, TFile, WorkspaceLeaf } from "obsidian";
+import { ItemView, MarkdownView, Menu, normalizePath, Notice, setIcon, TFile, WorkspaceLeaf } from "obsidian";
 
 import type CodexidianPlugin from "./main";
 import type {
@@ -101,7 +101,6 @@ export class CodexidianView extends ItemView {
   private messageQueue: string[] = [];
   private currentTurnId: string | null = null;
   private queueIndicatorEl: HTMLElement | null = null;
-  private sendHintEl: HTMLElement | null = null;
   private modelLabelEl: HTMLElement | null = null;
   private effortLabelEl: HTMLElement | null = null;
   private skillLabelEl: HTMLElement | null = null;
@@ -157,9 +156,13 @@ export class CodexidianView extends ItemView {
 
     // Header right buttons
     const headerRight = headerEl.createDiv({ cls: "codexidian-header-right" });
-    this.historyBtn = headerRight.createEl("button", { text: t("history") });
-    this.newThreadBtn = headerRight.createEl("button", { text: t("newThread") });
-    this.restartBtn = headerRight.createEl("button", { text: t("restart") });
+    this.historyBtn = headerRight.createEl("button", { cls: "codexidian-header-icon-btn" });
+    this.newThreadBtn = headerRight.createEl("button", { cls: "codexidian-header-icon-btn" });
+    this.restartBtn = headerRight.createEl("button", { cls: "codexidian-header-icon-btn" });
+    this.historyBtn.type = "button";
+    this.newThreadBtn.type = "button";
+    this.restartBtn.type = "button";
+    this.updateHeaderButtons();
 
     // Messages container (holds tab panels)
     this.messagesContainer = this.rootEl.createDiv({ cls: "codexidian-messages-container" });
@@ -193,6 +196,10 @@ export class CodexidianView extends ItemView {
     const inputWrapEl = inputRowEl.createDiv({ cls: "codexidian-input-wrap" });
     this.inputEl = inputWrapEl.createEl("textarea", { cls: "codexidian-input" });
     this.inputEl.placeholder = t("askPlaceholder");
+    this.sendBtn = inputRowEl.createEl("button", { cls: "codexidian-send-btn", text: t("send") });
+    this.sendBtn.type = "button";
+    this.sendBtn.setAttribute("aria-label", t("send"));
+    this.sendBtn.setAttribute("title", t("send"));
     this.slashMenu = new SlashCommandMenu(inputWrapEl);
     this.registerBuiltinSlashCommands();
 
@@ -261,9 +268,6 @@ export class CodexidianView extends ItemView {
       this.openApprovalModeMenu(event);
     });
 
-    const actionsEl = footerEl.createDiv({ cls: "codexidian-actions" });
-    this.sendHintEl = actionsEl.createDiv({ cls: "codexidian-hint", text: t("sendShortcutHint") });
-    this.sendBtn = actionsEl.createEl("button", { text: t("send") });
     this.queueIndicatorEl = footerEl.createDiv({ cls: "codexidian-queue-indicator" });
     this.updateQueueIndicator();
     this.dropZoneEl = this.rootEl.createDiv({ cls: "codexidian-drop-zone" });
@@ -712,12 +716,18 @@ export class CodexidianView extends ItemView {
 
   private updateSkillButtonText(): void {
     if (!this.skillMenuBtn) return;
-    this.skillMenuBtn.setText(this.getSkillPresetLabel(this.plugin.settings.skillPreset));
+    const label = this.getSkillPresetLabel(this.plugin.settings.skillPreset);
+    this.skillMenuBtn.setText(label);
+    this.skillMenuBtn.setAttribute("aria-label", `${t("skill")}: ${label}`);
+    this.skillMenuBtn.setAttribute("title", `${t("skill")}: ${label}`);
   }
 
   private updateModeButtonText(): void {
     if (!this.modeMenuBtn) return;
-    this.modeMenuBtn.setText(this.getApprovalModeLabel(this.plugin.settings.approvalMode));
+    const label = this.getApprovalModeLabel(this.plugin.settings.approvalMode);
+    this.modeMenuBtn.setText(label);
+    this.modeMenuBtn.setAttribute("aria-label", `${t("mode")}: ${label}`);
+    this.modeMenuBtn.setAttribute("title", `${t("mode")}: ${label}`);
   }
 
   private async openSkillMenu(event: MouseEvent): Promise<void> {
@@ -2433,9 +2443,7 @@ export class CodexidianView extends ItemView {
 
   refreshLocale(): void {
     this.titleEl?.setText(t("appTitle"));
-    this.historyBtn?.setText(t("history"));
-    this.newThreadBtn?.setText(t("newThread"));
-    this.restartBtn?.setText(t("restart"));
+    this.updateHeaderButtons();
     this.inputEl.placeholder = t("askPlaceholder");
     this.modelLabelEl?.setText(t("model"));
     this.effortLabelEl?.setText(t("effort"));
@@ -2448,8 +2456,9 @@ export class CodexidianView extends ItemView {
       this.attachBtn.setAttr("title", t("attachImage"));
     }
     this.dropZoneTextEl?.setText(t("dropImagesHere"));
-    this.sendHintEl?.setText(t("sendShortcutHint"));
     this.sendBtn?.setText(t("send"));
+    this.sendBtn?.setAttribute("aria-label", t("send"));
+    this.sendBtn?.setAttribute("title", t("send"));
     this.updateNoteContextToggle();
     this.registerBuiltinSlashCommands();
     this.statusPanel?.refreshLocale();
@@ -2796,12 +2805,30 @@ export class CodexidianView extends ItemView {
     this.statusEl.setText(
       `${engineText} | ${runningText} | ${threadText} | ${settings.model || t("defaultModel")} | ${settings.thinkingEffort} | ${settings.approvalPolicy}`,
     );
-    this.restartBtn?.setText(connected ? t("restart") : t("reconnect"));
+    this.updateHeaderButtons();
     this.sendBtn.disabled = false;
     this.inputEl.disabled = false;
     this.newThreadBtn.disabled = this.running;
     this.restartBtn.disabled = this.running;
     this.updateQueueIndicator();
+  }
+
+  private updateHeaderButtons(): void {
+    this.setHeaderIconButton(this.historyBtn, "clock", t("history"));
+    this.setHeaderIconButton(this.newThreadBtn, "file-plus", t("newThread"));
+    const restartTitle = this.plugin.client?.isRunning() ? t("restart") : t("reconnect");
+    this.setHeaderIconButton(this.restartBtn, "refresh-cw", restartTitle);
+  }
+
+  private setHeaderIconButton(
+    button: HTMLButtonElement | null | undefined,
+    icon: string,
+    tooltip: string,
+  ): void {
+    if (!button) return;
+    setIcon(button, icon);
+    button.setAttribute("aria-label", tooltip);
+    button.setAttribute("title", tooltip);
   }
 
   private isValidTabManagerState(state: unknown): state is TabManagerState {
