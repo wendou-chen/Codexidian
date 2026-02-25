@@ -959,7 +959,7 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
   background: var(--background-secondary);
-  padding: 8px 10px;
+  padding: 6px 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -969,6 +969,12 @@
   align-items: center;
   gap: 6px;
   font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.codexidian-tool-header:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 .codexidian-tool-icon {
   color: var(--text-muted);
@@ -976,6 +982,14 @@
 .codexidian-tool-title {
   font-weight: 600;
   color: var(--text-normal);
+}
+.codexidian-tool-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.codexidian-tool-card.is-collapsed .codexidian-tool-body {
+  display: none;
 }
 .codexidian-tool-command,
 .codexidian-tool-file {
@@ -991,8 +1005,10 @@
   padding: 4px 6px;
   background: var(--background-primary);
 }
+.codexidian-tool-output-wrap.is-empty {
+  display: none;
+}
 .codexidian-tool-output-summary {
-  cursor: pointer;
   font-size: 11px;
   color: var(--text-muted);
 }
@@ -1015,6 +1031,12 @@
 .codexidian-tool-status-error {
   margin-left: auto;
   color: var(--text-error);
+}
+.codexidian-tool-duration {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 8px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* --- Approval Card --- */

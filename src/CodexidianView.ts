@@ -723,7 +723,6 @@ export class CodexidianView extends ItemView {
     const label = this.getSkillPresetLabel(this.plugin.settings.skillPreset);
     this.skillMenuBtn.setText(label);
     this.skillMenuBtn.setAttribute("aria-label", `${t("skill")}: ${label}`);
-    this.skillMenuBtn.setAttribute("title", `${t("skill")}: ${label}`);
   }
 
   private updateModeButtonText(): void {
@@ -731,7 +730,6 @@ export class CodexidianView extends ItemView {
     const label = this.getApprovalModeLabel(this.plugin.settings.approvalMode);
     this.modeMenuBtn.setText(label);
     this.modeMenuBtn.setAttribute("aria-label", `${t("mode")}: ${label}`);
-    this.modeMenuBtn.setAttribute("title", `${t("mode")}: ${label}`);
   }
 
   private async openSkillMenu(event: MouseEvent): Promise<void> {
@@ -1552,11 +1550,12 @@ export class CodexidianView extends ItemView {
               status: info.status,
             });
             const card = ensureToolCard(info.itemId, info);
-            card.complete(info.status);
             const startedAt = toolStartTimes.get(info.itemId);
+            const durationMs = startedAt ? Date.now() - startedAt : undefined;
+            card.complete(info.status, durationMs);
             this.statusPanel?.updateEntry(info.itemId, {
               status: this.resolveEntryStatus(info.status),
-              duration: startedAt ? Date.now() - startedAt : undefined,
+              duration: durationMs,
             });
             runningToolIds.delete(info.itemId);
             if (activeToolItemId === info.itemId) {
@@ -2889,14 +2888,12 @@ export class CodexidianView extends ItemView {
     if (!button) return;
     setIcon(button, icon);
     button.setAttribute("aria-label", tooltip);
-    button.setAttribute("title", tooltip);
   }
 
   private updateSendButton(): void {
     if (!this.sendBtn) return;
     setIcon(this.sendBtn, "arrow-up");
     this.sendBtn.setAttribute("aria-label", t("send"));
-    this.sendBtn.setAttribute("title", t("send"));
   }
 
   private autoResizeInput(): void {
