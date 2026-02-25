@@ -247,11 +247,17 @@ export interface Conversation {
 
 export type ConversationListFilter = "all" | "active" | "archived" | "pinned";
 
+export interface ChatMessageImage {
+  name: string;
+  dataUrl: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
   timestamp: number;
+  images?: ChatMessageImage[];
 }
 
 // --- Tabs ---

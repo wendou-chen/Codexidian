@@ -32,6 +32,11 @@ interface CommandProbeResult {
   detail: string;
 }
 
+type TurnImageOption = {
+  dataUrl?: string;
+  path?: string;
+};
+
 export class CodexAppServerClient {
   private process: ChildProcess | null = null;
   private stdoutBuffer = "";
@@ -180,7 +185,7 @@ export class CodexAppServerClient {
   async sendTurn(
     prompt: string,
     handlers: TurnHandlers = {},
-    options?: { model?: string; effort?: string; images?: Array<{ dataUrl: string }> },
+    options?: { model?: string; effort?: string; images?: TurnImageOption[] },
   ): Promise<TurnResult> {
     this.debugLog("sendTurn:start", {
       promptLength: prompt.length,
@@ -578,12 +583,44 @@ export class CodexAppServerClient {
   private buildTurnStartParams(
     threadId: string,
     prompt: string,
-    options?: { model?: string; effort?: string; images?: Array<{ dataUrl: string }> },
+    options?: { model?: string; effort?: string; images?: TurnImageOption[] },
   ): Record<string, unknown> {
-    const imageInputs = (options?.images ?? [])
-      .map((image) => (typeof image?.dataUrl === "string" ? image.dataUrl.trim() : ""))
-      .filter((url) => url.length > 0)
-      .map((url) => ({ type: "image", url }));
+    const imageInputs: Array<{ type: "image"; url: string } | { type: "localImage"; path: string }> = [];
+    let droppedImages = 0;
+
+    for (const image of options?.images ?? []) {
+      const localPath = typeof image?.path === "string" ? image.path.trim() : "";
+      if (localPath.length > 0) {
+        imageInputs.push({ type: "localImage", path: localPath });
+        continue;
+      }
+
+      const rawUrl = typeof image?.dataUrl === "string" ? image.dataUrl.trim() : "";
+      const normalizedUrl = this.normalizeImageUrl(rawUrl);
+      if (!normalizedUrl) {
+        droppedImages += 1;
+        continue;
+      }
+      imageInputs.push({ type: "image", url: normalizedUrl });
+    }
+
+    if (imageInputs.length > 0 || droppedImages > 0) {
+      const firstImage = imageInputs[0];
+      this.debugLog("image payload", {
+        count: imageInputs.length,
+        droppedImages,
+        firstImageType: firstImage?.type ?? null,
+        firstImageUrlPrefix: firstImage && firstImage.type === "image"
+          ? firstImage.url.slice(0, 50)
+          : null,
+        firstImageUrlLength: firstImage && firstImage.type === "image"
+          ? firstImage.url.length
+          : null,
+        firstImagePath: firstImage && firstImage.type === "localImage"
+          ? firstImage.path
+          : null,
+      });
+    }
 
     return {
       threadId,
@@ -601,6 +638,27 @@ export class CodexAppServerClient {
       outputSchema: null,
       collaborationMode: null,
     };
+  }
+
+  private normalizeImageUrl(url: string): string | null {
+    const normalized = url.trim();
+    if (!normalized) {
+      return null;
+    }
+    if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(normalized)) {
+      return normalized;
+    }
+    if (/^https?:\/\//i.test(normalized)) {
+      return normalized;
+    }
+    if (/^file:\/\//i.test(normalized)) {
+      return normalized;
+    }
+    // Fallback for raw base64 strings without a data URL prefix.
+    if (/^[A-Za-z0-9+/]+={0,2}$/.test(normalized) && normalized.length >= 64) {
+      return `data:image/png;base64,${normalized}`;
+    }
+    return null;
   }
 
   private isThreadNotFoundError(message: string): boolean {

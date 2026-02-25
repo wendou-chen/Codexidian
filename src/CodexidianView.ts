@@ -1305,7 +1305,7 @@ export class CodexidianView extends ItemView {
       }
     }
 
-    let imageAttachments: Array<{ name: string; dataUrl: string }> = [];
+    let imageAttachments: Array<{ name: string; dataUrl: string; path?: string }> = [];
     try {
       imageAttachments = this.imageContext?.getImages() ?? [];
     } catch (error) {
@@ -1316,8 +1316,9 @@ export class CodexidianView extends ItemView {
       .map((image) => ({
         name: image.name,
         dataUrl: typeof image.dataUrl === "string" ? image.dataUrl.trim() : "",
+        path: typeof image.path === "string" ? image.path.trim() : "",
       }))
-      .filter((image) => image.dataUrl.length > 0);
+      .filter((image) => image.dataUrl.length > 0 || image.path.length > 0);
     const reviewComments = this.consumeReviewCommentsForActiveTab();
     const promptWithTurnControls = this.buildPromptWithTurnControls(prompt);
     const promptWithReviewComments = this.appendReviewCommentsToPrompt(promptWithTurnControls, reviewComments);
@@ -1342,12 +1343,25 @@ export class CodexidianView extends ItemView {
       approvalMode: this.plugin.settings.approvalMode,
       notePath,
     });
+    if (imageInputs.length > 0) {
+      const firstImage = imageInputs[0];
+      this.debugLog("sendCurrentInput:image payload", {
+        count: imageInputs.length,
+        firstImageHasPath: firstImage.path.length > 0,
+        firstImagePath: firstImage.path.length > 0 ? firstImage.path : null,
+        firstImageUrlPrefix: firstImage.dataUrl.slice(0, 50),
+        firstImageUrlLength: firstImage.dataUrl.length,
+      });
+    }
 
-    // Show user message (original text only)
+    // Show user message (original text + image thumbnails, when present)
     let assistantEl: HTMLElement;
     try {
-      const userMessage = cc.addMessage("user", prompt);
-      this.appendMessageToPanel(tab.panelEl, "user", prompt, userMessage.id);
+      const userImages = imageInputs.length > 0
+        ? imageInputs.map((image) => ({ name: image.name, dataUrl: image.dataUrl }))
+        : undefined;
+      const userMessage = cc.addMessage("user", prompt, { images: userImages });
+      this.appendMessageToPanel(tab.panelEl, "user", prompt, userMessage.id, userMessage.images);
       // Create assistant message element for streaming
       assistantEl = this.createMessageEl(tab.panelEl, "assistant");
     } catch (error) {
@@ -1577,6 +1591,13 @@ export class CodexidianView extends ItemView {
           images: imageInputs.length > 0 ? imageInputs : undefined,
         },
       );
+      if (imageInputs.length > 0) {
+        try {
+          this.imageContext?.clear();
+        } catch (error) {
+          this.debugError("sendCurrentInput:imageContext-clear-after-send", error);
+        }
+      }
       const captureTurnId = () => {
         if (this.currentTurnId || !this.running || sendSeq !== this.sendSequence) {
           return;
@@ -1683,7 +1704,6 @@ export class CodexidianView extends ItemView {
       this.updateStatus();
       try {
         this.fileContext?.clear();
-        this.imageContext?.clear();
       } catch {
         // Keep message flow intact if context cleanup fails.
       }
@@ -1927,7 +1947,13 @@ export class CodexidianView extends ItemView {
         const el = this.createMessageEl(panelEl, "assistant", msg.id);
         await this.messageRenderer.renderContent(el, msg.content);
       } else {
-        this.appendMessageToPanel(panelEl, msg.role, msg.content, msg.id);
+        this.appendMessageToPanel(
+          panelEl,
+          msg.role,
+          msg.content,
+          msg.id,
+          msg.role === "user" ? msg.images : undefined,
+        );
       }
     }
   }
@@ -1948,11 +1974,44 @@ export class CodexidianView extends ItemView {
     return messageEl;
   }
 
-  private appendMessageToPanel(panelEl: HTMLElement, role: string, text: string, messageId?: string): HTMLElement {
+  private appendMessageToPanel(
+    panelEl: HTMLElement,
+    role: string,
+    text: string,
+    messageId?: string,
+    images?: Array<{ name: string; dataUrl: string }>,
+  ): HTMLElement {
     const el = this.createMessageEl(panelEl, role, messageId);
     el.setText(text);
+    if (role === "user" && images && images.length > 0) {
+      this.appendMessageImages(el, images);
+    }
     panelEl.scrollTop = panelEl.scrollHeight;
     return el;
+  }
+
+  private appendMessageImages(
+    messageEl: HTMLElement,
+    images: Array<{ name: string; dataUrl: string }>,
+  ): void {
+    const validImages = images
+      .map((image) => ({
+        name: image.name,
+        dataUrl: typeof image.dataUrl === "string" ? image.dataUrl.trim() : "",
+      }))
+      .filter((image) => image.dataUrl.length > 0);
+    if (validImages.length === 0) {
+      return;
+    }
+
+    const rowEl = messageEl.createDiv({ cls: "codexidian-msg-images" });
+    for (const image of validImages) {
+      const thumbEl = rowEl.createEl("img", { cls: "codexidian-msg-image-thumb" });
+      thumbEl.src = image.dataUrl;
+      thumbEl.alt = image.name;
+      thumbEl.title = image.name;
+      thumbEl.loading = "lazy";
+    }
   }
 
   private attachUserMessageActions(wrapperEl: HTMLElement, messageId: string): void {

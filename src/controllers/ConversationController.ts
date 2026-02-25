@@ -74,7 +74,11 @@ export class ConversationController {
     return this.switchTo(id);
   }
 
-  addMessage(role: ChatMessage["role"], content: string): ChatMessage {
+  addMessage(
+    role: ChatMessage["role"],
+    content: string,
+    options?: { images?: ChatMessage["images"] },
+  ): ChatMessage {
     if (!this.activeConversation) {
       throw new Error("No active conversation");
     }
@@ -84,6 +88,11 @@ export class ConversationController {
       content,
       timestamp: Date.now(),
     };
+    if (options?.images && options.images.length > 0) {
+      msg.images = options.images
+        .filter((image) => image.dataUrl.trim().length > 0)
+        .map((image) => ({ name: image.name, dataUrl: image.dataUrl }));
+    }
     this.activeConversation.messages.push(msg);
     this.activeConversation.updatedAt = Date.now();
     if (role === "assistant") {
@@ -108,7 +117,7 @@ export class ConversationController {
     this.activeConversation.updatedAt = Date.now();
     this.recomputeLastResponseAt();
     await this.flushSave();
-    return { ...target };
+    return this.cloneMessage(target);
   }
 
   getMessagesUpTo(messageId: string): ChatMessage[] {
@@ -123,7 +132,7 @@ export class ConversationController {
 
     return this.activeConversation.messages
       .slice(0, index + 1)
-      .map((msg) => ({ ...msg }));
+      .map((msg) => this.cloneMessage(msg));
   }
 
   setMessages(messages: ChatMessage[]): void {
@@ -131,7 +140,7 @@ export class ConversationController {
       throw new Error("No active conversation");
     }
 
-    this.activeConversation.messages = messages.map((msg) => ({ ...msg }));
+    this.activeConversation.messages = messages.map((msg) => this.cloneMessage(msg));
     this.activeConversation.updatedAt = Date.now();
     this.recomputeLastResponseAt();
     this.scheduleSave();
@@ -223,5 +232,22 @@ export class ConversationController {
     }
     const latest = assistantMessages.reduce((max, msg) => Math.max(max, msg.timestamp), 0);
     this.activeConversation.lastResponseAt = latest > 0 ? latest : undefined;
+  }
+
+  private cloneMessage(message: ChatMessage): ChatMessage {
+    const normalizedImages = Array.isArray(message.images)
+      ? message.images
+        .filter((image): image is { name: string; dataUrl: string } => (
+          Boolean(image)
+          && typeof image.name === "string"
+          && typeof image.dataUrl === "string"
+          && image.dataUrl.trim().length > 0
+        ))
+        .map((image) => ({ name: image.name, dataUrl: image.dataUrl }))
+      : undefined;
+    return {
+      ...message,
+      images: normalizedImages,
+    };
   }
 }

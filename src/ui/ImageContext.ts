@@ -2,6 +2,7 @@ interface ImageAttachment {
   name: string;
   dataUrl: string;
   sizeBytes: number;
+  path?: string;
 }
 
 interface ImageContextOptions {
@@ -65,8 +66,12 @@ export class ImageContext {
     }
   }
 
-  getImages(): Array<{ name: string; dataUrl: string }> {
-    return this.images.map((image) => ({ name: image.name, dataUrl: image.dataUrl }));
+  getImages(): Array<{ name: string; dataUrl: string; path?: string }> {
+    return this.images.map((image) => ({
+      name: image.name,
+      dataUrl: image.dataUrl,
+      path: image.path,
+    }));
   }
 
   async addFiles(files: FileList | File[]): Promise<number> {
@@ -226,10 +231,12 @@ export class ImageContext {
     for (const file of selected) {
       try {
         const dataUrl = await this.fileToDataUrl(file);
+        const localPath = this.extractLocalPath(file);
         this.images.push({
           name: this.getAttachmentName(file, added),
           dataUrl,
           sizeBytes: file.size,
+          path: localPath,
         });
         added += 1;
       } catch {
@@ -345,5 +352,14 @@ export class ImageContext {
       };
       reader.readAsDataURL(file);
     });
+  }
+
+  private extractLocalPath(file: File): string | undefined {
+    const candidate = (file as File & { path?: unknown }).path;
+    if (typeof candidate !== "string") {
+      return undefined;
+    }
+    const normalized = candidate.trim();
+    return normalized.length > 0 ? normalized : undefined;
   }
 }

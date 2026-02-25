@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "D:\\a考研\\Obsidian Vault\\.obsidian\\plugins\\codexidian\\logs\\.41967fd9127999d498badea86c810de630d3431f-audit.json",
+    "files": [
+        {
+            "date": 1772037084947,
+            "name": "D:\\a考研\\Obsidian Vault\\.obsidian\\plugins\\codexidian\\logs\\mcp-puppeteer-2026-02-26.log",
+            "hash": "1341855ee15c0c733016be18560a0783e85a1c4197df740b3f1ef94fb51a9532"
+        }
+    ],
+    "hashType": "sha256"
+}

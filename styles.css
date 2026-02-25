@@ -229,6 +229,20 @@
   color: var(--text-muted);
   background: var(--background-primary);
 }
+.codexidian-msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.codexidian-msg-image-thumb {
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  object-fit: contain;
+  background: var(--background-primary);
+}
 .codexidian-message-content {
   line-height: 1.6;
   font-size: 13px;
