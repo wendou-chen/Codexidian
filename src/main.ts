@@ -13,12 +13,16 @@ import { CodexidianView, VIEW_TYPE_CODEXIDIAN } from "./CodexidianView";
 import { isLocale, setLocale, t, tf } from "./i18n";
 import { VaultMcpService, type VaultMcpWriteApprovalRequest } from "./mcp/VaultMcpService";
 import {
+  APPROVAL_MODES,
+  type AllowRule,
+  type AllowRuleType,
   DEFAULT_SETTINGS,
   type ApprovalDecision,
   type ApprovalRequest,
   AVAILABLE_MODELS,
   type CodexidianSettings,
   EFFORT_OPTIONS,
+  isApprovalMode,
   type McpToolCallRequest,
   type McpToolCallResult,
   type UserInputRequest,
@@ -29,9 +33,11 @@ export default class CodexidianPlugin extends Plugin {
   settings: CodexidianSettings = { ...DEFAULT_SETTINGS };
   client!: CodexAppServerClient;
   private mcpService!: VaultMcpService;
+  private availableSkills: string[] = [];
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    await this.refreshAvailableSkills();
     setLocale(this.settings.locale);
     this.mcpService = new VaultMcpService(
       this.app,
@@ -128,7 +134,68 @@ export default class CodexidianPlugin extends Plugin {
     return null;
   }
 
+  getAvailableSkills(): string[] {
+    return [...this.availableSkills];
+  }
+
+  async refreshAvailableSkills(): Promise<string[]> {
+    const result: string[] = [];
+    const seen = new Set<string>();
+    try {
+      const listing = await this.app.vault.adapter.list(".codex/skills");
+      const folders = Array.isArray((listing as { folders?: unknown }).folders)
+        ? (listing as { folders: unknown[] }).folders
+        : [];
+
+      for (const folder of folders) {
+        if (typeof folder !== "string") continue;
+        const normalized = folder.replace(/\\/g, "/");
+        const segments = normalized.split("/").filter(Boolean);
+        const name = segments[segments.length - 1]?.trim();
+        if (!name || seen.has(name)) continue;
+
+        const hasSkillMarkdown = await this.app.vault.adapter.exists(`${normalized}/SKILL.md`);
+        if (!hasSkillMarkdown) continue;
+        seen.add(name);
+        result.push(name);
+      }
+    } catch {
+      // Keep cached list if scanning fails.
+      return this.getAvailableSkills();
+    }
+
+    result.sort((a, b) => a.localeCompare(b));
+    this.availableSkills = result;
+
+    if (this.settings.skillPreset !== "none" && !result.includes(this.settings.skillPreset)) {
+      this.settings.skillPreset = "none";
+      await this.saveSettings();
+    }
+
+    return this.getAvailableSkills();
+  }
+
   private async handleApprovalRequest(request: ApprovalRequest): Promise<ApprovalDecision> {
+    if (this.settings.approvalMode === "safe") {
+      return "decline";
+    }
+    if (this.settings.approvalMode === "yolo") {
+      return "accept";
+    }
+
+    const matchedRule = this.findMatchingAllowRule(request);
+    if (matchedRule) {
+      const view = this.getOpenView();
+      if (view) {
+        view.appendSystemMessage(tf("messageAutoApprovedByRule", {
+          summary: this.buildApprovalSummary(request),
+          pattern: matchedRule.pattern,
+        }));
+        view.updateStatus();
+      }
+      return "accept";
+    }
+
     let view = this.getOpenView();
     if (!view) {
       await this.activateView();
@@ -138,6 +205,40 @@ export default class CodexidianPlugin extends Plugin {
       throw new Error("Codexidian view is not available for approval.");
     }
     return await view.showApprovalCard(request);
+  }
+
+  async addAllowRuleFromApprovalRequest(
+    request: ApprovalRequest,
+  ): Promise<{ status: "added" | "exists"; ruleType: AllowRuleType; pattern: string }> {
+    const candidate = this.extractAllowRuleCandidate(request);
+    if (!candidate) {
+      throw new Error("Unable to extract allow rule from approval request.");
+    }
+
+    const existing = this.settings.allowRules.find((rule) => (
+      rule.type === candidate.type && rule.pattern === candidate.pattern
+    ));
+    if (existing) {
+      return {
+        status: "exists",
+        ruleType: existing.type,
+        pattern: existing.pattern,
+      };
+    }
+
+    const rule: AllowRule = {
+      id: `allow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      type: candidate.type,
+      pattern: candidate.pattern,
+      createdAt: Date.now(),
+    };
+    this.settings.allowRules.push(rule);
+    await this.saveSettings();
+    return {
+      status: "added",
+      ruleType: rule.type,
+      pattern: rule.pattern,
+    };
   }
 
   private async handleUserInputRequest(request: UserInputRequest): Promise<UserInputResponse> {
@@ -253,6 +354,22 @@ export default class CodexidianPlugin extends Plugin {
       this.settings.workingDirectory = this.getVaultBasePath();
     }
 
+    if (typeof this.settings.skillPreset !== "string" || this.settings.skillPreset.trim().length === 0) {
+      this.settings.skillPreset = DEFAULT_SETTINGS.skillPreset;
+    } else {
+      this.settings.skillPreset = this.settings.skillPreset.trim();
+    }
+    if (!isApprovalMode(this.settings.approvalMode)) {
+      const legacyModeRaw = String((loaded as any)?.collaborationMode ?? "").trim().toLowerCase();
+      this.settings.approvalMode = (
+        legacyModeRaw === "autonomous"
+        || legacyModeRaw === "interactive"
+        || legacyModeRaw === "plan-first"
+      )
+        ? DEFAULT_SETTINGS.approvalMode
+        : DEFAULT_SETTINGS.approvalMode;
+    }
+
     if (!Array.isArray(this.settings.securityBlockedPaths)) {
       this.settings.securityBlockedPaths = [...DEFAULT_SETTINGS.securityBlockedPaths];
     } else {
@@ -261,6 +378,8 @@ export default class CodexidianPlugin extends Plugin {
         .filter((pattern) => pattern.length > 0);
     }
 
+    this.settings.allowRules = this.normalizeAllowRules(this.settings.allowRules);
+
     if (!Number.isFinite(this.settings.securityMaxNoteSize) || this.settings.securityMaxNoteSize <= 0) {
       this.settings.securityMaxNoteSize = DEFAULT_SETTINGS.securityMaxNoteSize;
     }
@@ -268,6 +387,203 @@ export default class CodexidianPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  private normalizeAllowRules(input: unknown): AllowRule[] {
+    if (!Array.isArray(input)) {
+      return [];
+    }
+
+    const normalized: AllowRule[] = [];
+    for (const entry of input) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const typeValue = String((entry as Partial<AllowRule>).type ?? "").trim();
+      if (!this.isAllowRuleType(typeValue)) {
+        continue;
+      }
+      const pattern = String((entry as Partial<AllowRule>).pattern ?? "").trim();
+      if (!pattern) {
+        continue;
+      }
+      const createdAtRaw = Number((entry as Partial<AllowRule>).createdAt);
+      const createdAt = Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? createdAtRaw : Date.now();
+      const idRaw = String((entry as Partial<AllowRule>).id ?? "").trim();
+      const id = idRaw || `allow-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
+      normalized.push({
+        id,
+        type: typeValue,
+        pattern,
+        createdAt,
+      });
+    }
+    return normalized;
+  }
+
+  private isAllowRuleType(value: string): value is AllowRuleType {
+    return value === "command" || value === "file_write" || value === "tool";
+  }
+
+  private findMatchingAllowRule(request: ApprovalRequest): AllowRule | null {
+    const rules = this.settings.allowRules;
+    if (!Array.isArray(rules) || rules.length === 0) {
+      return null;
+    }
+
+    const command = this.extractApprovalCommand(request);
+    const toolName = this.extractApprovalToolName(request);
+    const filePaths = this.extractApprovalFilePaths(request);
+
+    for (const rule of rules) {
+      if (rule.type === "command") {
+        if (command && command.startsWith(rule.pattern)) {
+          return rule;
+        }
+        continue;
+      }
+
+      if (rule.type === "file_write") {
+        const normalizedRule = this.normalizeFilePathForRule(rule.pattern);
+        const matched = filePaths.some((path) => this.normalizeFilePathForRule(path).startsWith(normalizedRule));
+        if (matched) {
+          return rule;
+        }
+        continue;
+      }
+
+      if (rule.type === "tool") {
+        if (toolName && toolName.toLowerCase() === rule.pattern.toLowerCase()) {
+          return rule;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private extractAllowRuleCandidate(request: ApprovalRequest): { type: AllowRuleType; pattern: string } | null {
+    const command = this.extractApprovalCommand(request);
+    if (command) {
+      return { type: "command", pattern: command };
+    }
+
+    const filePath = this.extractApprovalFilePaths(request)[0];
+    if (filePath) {
+      return { type: "file_write", pattern: filePath };
+    }
+
+    const toolName = this.extractApprovalToolName(request);
+    if (toolName) {
+      return { type: "tool", pattern: toolName };
+    }
+
+    return null;
+  }
+
+  private extractApprovalCommand(request: ApprovalRequest): string {
+    const direct = typeof request.command === "string" ? request.command.trim() : "";
+    if (direct) {
+      return direct;
+    }
+    const params = request.params as Record<string, unknown> | undefined;
+    const fromParams = [
+      params?.command,
+      params?.cmd,
+      (params?.input as Record<string, unknown> | undefined)?.command,
+      (params?.request as Record<string, unknown> | undefined)?.command,
+      (params?.request as Record<string, unknown> | undefined)?.cmd,
+    ].find((value) => typeof value === "string");
+    return typeof fromParams === "string" ? fromParams.trim() : "";
+  }
+
+  private extractApprovalFilePaths(request: ApprovalRequest): string[] {
+    const paths: string[] = [];
+    if (typeof request.filePath === "string" && request.filePath.trim()) {
+      paths.push(request.filePath.trim());
+    }
+    const params = request.params as Record<string, unknown> | undefined;
+    const directValues = [
+      params?.path,
+      params?.filePath,
+      params?.targetPath,
+      (params?.request as Record<string, unknown> | undefined)?.path,
+      (params?.request as Record<string, unknown> | undefined)?.filePath,
+      (params?.request as Record<string, unknown> | undefined)?.targetPath,
+    ];
+    for (const value of directValues) {
+      if (typeof value === "string" && value.trim()) {
+        paths.push(value.trim());
+      }
+    }
+    const files = params?.files;
+    if (Array.isArray(files)) {
+      for (const file of files) {
+        if (typeof file === "string" && file.trim()) {
+          paths.push(file.trim());
+          continue;
+        }
+        if (!file || typeof file !== "object") {
+          continue;
+        }
+        const fileObj = file as Record<string, unknown>;
+        const candidate = [fileObj.path, fileObj.filePath, fileObj.newPath, fileObj.oldPath]
+          .find((value) => typeof value === "string" && value.trim().length > 0);
+        if (typeof candidate === "string") {
+          paths.push(candidate.trim());
+        }
+      }
+    }
+
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const path of paths) {
+      const key = path.trim();
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      deduped.push(key);
+    }
+    return deduped;
+  }
+
+  private extractApprovalToolName(request: ApprovalRequest): string {
+    const params = request.params as Record<string, unknown> | undefined;
+    const candidate = [
+      params?.tool,
+      params?.toolName,
+      params?.name,
+      (params?.request as Record<string, unknown> | undefined)?.tool,
+      (params?.request as Record<string, unknown> | undefined)?.toolName,
+      (params?.request as Record<string, unknown> | undefined)?.name,
+    ].find((value) => typeof value === "string" && value.trim().length > 0);
+    return typeof candidate === "string" ? candidate.trim() : "";
+  }
+
+  private normalizeFilePathForRule(path: string): string {
+    return path
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/\/{2,}/g, "/")
+      .replace(/^\.\//, "")
+      .toLowerCase();
+  }
+
+  private buildApprovalSummary(request: ApprovalRequest): string {
+    const command = this.extractApprovalCommand(request);
+    if (command) {
+      return `${request.type} (${command.slice(0, 80)})`;
+    }
+    const filePath = this.extractApprovalFilePaths(request)[0];
+    if (filePath) {
+      return `${request.type} (${filePath})`;
+    }
+    const toolName = this.extractApprovalToolName(request);
+    if (toolName) {
+      return `${request.type} (${toolName})`;
+    }
+    return request.type;
   }
 }
 
@@ -355,6 +671,103 @@ class CodexidianSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName(t("settingSkillPresetName"))
+      .setDesc(t("settingSkillPresetDesc"))
+      .addDropdown((dropdown) => {
+        dropdown.addOption("none", t("skillPresetNone"));
+        for (const skill of this.plugin.getAvailableSkills()) {
+          dropdown.addOption(skill, skill);
+        }
+        const currentSkill = this.plugin.settings.skillPreset || "none";
+        if (currentSkill !== "none" && !this.plugin.getAvailableSkills().includes(currentSkill)) {
+          dropdown.addOption(currentSkill, currentSkill);
+        }
+        dropdown
+          .setValue(currentSkill)
+          .onChange(async (value) => {
+            this.plugin.settings.skillPreset = value.trim() || DEFAULT_SETTINGS.skillPreset;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName(t("settingCollaborationModeName"))
+      .setDesc(t("settingCollaborationModeDesc"))
+      .addDropdown((dropdown) => {
+        for (const mode of APPROVAL_MODES) {
+          dropdown.addOption(mode.value, `${mode.label} (${mode.description})`);
+        }
+        dropdown
+          .setValue(this.plugin.settings.approvalMode)
+          .onChange(async (value) => {
+            this.plugin.settings.approvalMode = isApprovalMode(value)
+              ? value
+              : DEFAULT_SETTINGS.approvalMode;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    containerEl.createEl("h3", { text: t("settingsAllowRulesSection") });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: t("settingsAllowRulesDesc"),
+    });
+
+    const rulesListEl = containerEl.createDiv({ cls: "codexidian-allow-rules-list" });
+    const rules = [...this.plugin.settings.allowRules].sort((a, b) => b.createdAt - a.createdAt);
+    if (rules.length === 0) {
+      rulesListEl.createDiv({ cls: "codexidian-allow-rules-empty", text: t("allowRulesEmpty") });
+    } else {
+      for (const rule of rules) {
+        const rowEl = rulesListEl.createDiv({ cls: "codexidian-allow-rule-item" });
+        rowEl.createDiv({
+          cls: "codexidian-allow-rule-meta",
+          text: `${this.getAllowRuleTypeLabel(rule.type)}: ${rule.pattern}`,
+        });
+        const removeBtn = rowEl.createEl("button", {
+          cls: "codexidian-allow-rule-remove",
+          text: t("allowRuleDelete"),
+        });
+        removeBtn.type = "button";
+        removeBtn.addEventListener("click", () => {
+          void (async () => {
+            try {
+              this.plugin.settings.allowRules = this.plugin.settings.allowRules.filter((item) => item.id !== rule.id);
+              await this.plugin.saveSettings();
+              new Notice(t("noticeAllowRuleRemoved"));
+              this.display();
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              new Notice(tf("noticeAllowRuleRemoveFailed", { error: message }));
+            }
+          })();
+        });
+      }
+    }
+
+    if (this.plugin.settings.allowRules.length > 0) {
+      new Setting(containerEl)
+        .setName(t("allowRulesClearAll"))
+        .addButton((button) =>
+          button.setButtonText(t("allowRulesClearAll")).onClick(() => {
+            void (async () => {
+              const confirmed = window.confirm(t("confirmAllowRulesClearAll"));
+              if (!confirmed) return;
+              try {
+                this.plugin.settings.allowRules = [];
+                await this.plugin.saveSettings();
+                new Notice(t("noticeAllowRulesCleared"));
+                this.display();
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                new Notice(tf("noticeAllowRulesClearFailed", { error: message }));
+              }
+            })();
+          }),
+        );
+    }
 
     new Setting(containerEl)
       .setName(t("settingApprovalPolicyName"))
@@ -560,5 +973,11 @@ class CodexidianSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+  }
+
+  private getAllowRuleTypeLabel(value: AllowRuleType): string {
+    if (value === "command") return t("allowRuleTypeCommand");
+    if (value === "file_write") return t("allowRuleTypeFileWrite");
+    return t("allowRuleTypeTool");
   }
 }

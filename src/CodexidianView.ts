@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, normalizePath, Notice, TFile, WorkspaceLeaf } from "obsidian";
+import { ItemView, MarkdownView, Menu, normalizePath, Notice, TFile, WorkspaceLeaf } from "obsidian";
 
 import type CodexidianPlugin from "./main";
 import type {
@@ -6,6 +6,11 @@ import type {
   ApprovalRequest,
   ChatMessage,
   ConversationMeta,
+  ConversationListFilter,
+  DiffEntry,
+  PlanStep,
+  PlanUpdate,
+  ReviewComment,
   SlashCommand,
   TabManagerState,
   ToolCompleteInfo,
@@ -13,7 +18,14 @@ import type {
   UserInputRequest,
   UserInputResponse,
 } from "./types";
-import { AVAILABLE_MODELS, EFFORT_OPTIONS, type ThinkingEffort } from "./types";
+import {
+  APPROVAL_MODES,
+  AVAILABLE_MODELS,
+  EFFORT_OPTIONS,
+  type ApprovalMode,
+  type SkillPreset,
+  type ThinkingEffort,
+} from "./types";
 import { VaultFileAdapter } from "./storage/VaultFileAdapter";
 import { SessionStorage } from "./storage/SessionStorage";
 import { MessageRenderer } from "./rendering/MessageRenderer";
@@ -25,6 +37,7 @@ import {
   ToolCallRenderer,
   type ToolCardHandle,
 } from "./rendering/ToolCallRenderer";
+import { PlanCardRenderer } from "./rendering/PlanCardRenderer";
 import { ConversationController } from "./controllers/ConversationController";
 import { SelectionController } from "./controllers/SelectionController";
 import { TabBar } from "./tabs/TabBar";
@@ -34,10 +47,17 @@ import { FileContext } from "./ui/FileContext";
 import { ImageContext } from "./ui/ImageContext";
 import { SlashCommandMenu } from "./ui/SlashCommandMenu";
 import { StatusPanel } from "./ui/StatusPanel";
+import { ReviewPane } from "./ui/ReviewPane";
+import { SessionModal } from "./ui/SessionModal";
 import { PathValidator } from "./security/PathValidator";
 import { t, tf } from "./i18n";
 
 export const VIEW_TYPE_CODEXIDIAN = "codexidian-view";
+
+interface ReviewTabState {
+  diffs: DiffEntry[];
+  comments: ReviewComment[];
+}
 
 export class CodexidianView extends ItemView {
   private rootEl!: HTMLElement;
@@ -49,14 +69,19 @@ export class CodexidianView extends ItemView {
   private noteContextTextEl!: HTMLElement;
   private noteContextToggleEl!: HTMLButtonElement;
   private selectionContextEl!: HTMLElement;
+  private attachBtn: HTMLButtonElement | null = null;
+  private imageFileInputEl: HTMLInputElement | null = null;
+  private dropZoneEl: HTMLElement | null = null;
+  private dropZoneTextEl: HTMLElement | null = null;
   private inputEl!: HTMLTextAreaElement;
   private sendBtn!: HTMLButtonElement;
   private modelSelect!: HTMLSelectElement;
   private effortSelect!: HTMLSelectElement;
+  private skillMenuBtn!: HTMLButtonElement;
+  private modeMenuBtn!: HTMLButtonElement;
   private newThreadBtn!: HTMLButtonElement;
   private restartBtn!: HTMLButtonElement;
   private historyBtn!: HTMLButtonElement;
-  private historyMenuEl!: HTMLElement;
 
   private vaultAdapter!: VaultFileAdapter;
   private sessionStorage!: SessionStorage;
@@ -68,21 +93,25 @@ export class CodexidianView extends ItemView {
   private imageContext: ImageContext | null = null;
   private slashMenu: SlashCommandMenu | null = null;
   private statusPanel: StatusPanel | null = null;
+  private reviewPane: ReviewPane | null = null;
   private tabManager!: TabManager;
   private tabBar!: TabBar;
 
   private running = false;
-  private historyOpen = false;
   private messageQueue: string[] = [];
   private currentTurnId: string | null = null;
   private queueIndicatorEl: HTMLElement | null = null;
   private sendHintEl: HTMLElement | null = null;
   private modelLabelEl: HTMLElement | null = null;
   private effortLabelEl: HTMLElement | null = null;
+  private skillLabelEl: HTMLElement | null = null;
+  private modeLabelEl: HTMLElement | null = null;
   private sendSequence = 0;
   private cancelledSendSequences = new Set<number>();
   private includeCurrentNoteContent = false;
-  private ctrlEnterHandler: ((e: KeyboardEvent) => void) | null = null;
+  private availableSkills: string[] = [];
+  private reviewStateByTabId = new Map<string, ReviewTabState>();
+  private planStateByTabId = new Map<string, PlanUpdate | null>();
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: CodexidianPlugin) {
     super(leaf);
@@ -128,14 +157,9 @@ export class CodexidianView extends ItemView {
 
     // Header right buttons
     const headerRight = headerEl.createDiv({ cls: "codexidian-header-right" });
-    headerRight.style.position = "relative";
     this.historyBtn = headerRight.createEl("button", { text: t("history") });
     this.newThreadBtn = headerRight.createEl("button", { text: t("newThread") });
     this.restartBtn = headerRight.createEl("button", { text: t("restart") });
-
-    // History menu (hidden by default)
-    this.historyMenuEl = headerRight.createDiv({ cls: "codexidian-history-menu" });
-    this.historyMenuEl.style.display = "none";
 
     // Messages container (holds tab panels)
     this.messagesContainer = this.rootEl.createDiv({ cls: "codexidian-messages-container" });
@@ -156,16 +180,28 @@ export class CodexidianView extends ItemView {
 
     const statusPanelEl = this.rootEl.createDiv({ cls: "codexidian-status-panel" });
     this.statusPanel = new StatusPanel(statusPanelEl);
+    const reviewPaneEl = this.rootEl.createDiv({ cls: "codexidian-review-pane-host" });
+    this.reviewPane = new ReviewPane(reviewPaneEl, {
+      onCommentsChanged: (comments) => this.handleReviewCommentsChanged(comments),
+    });
 
     // Footer
     const footerEl = this.rootEl.createDiv({ cls: "codexidian-footer" });
     const fileChipContainerEl = footerEl.createDiv({ cls: "codexidian-file-chips-container" });
     const imagePreviewContainerEl = footerEl.createDiv({ cls: "codexidian-image-previews-container" });
-    const inputWrapEl = footerEl.createDiv({ cls: "codexidian-input-wrap" });
+    const inputRowEl = footerEl.createDiv({ cls: "codexidian-input-row" });
+    const inputWrapEl = inputRowEl.createDiv({ cls: "codexidian-input-wrap" });
     this.inputEl = inputWrapEl.createEl("textarea", { cls: "codexidian-input" });
     this.inputEl.placeholder = t("askPlaceholder");
     this.slashMenu = new SlashCommandMenu(inputWrapEl);
     this.registerBuiltinSlashCommands();
+
+    this.imageFileInputEl = inputRowEl.createEl("input", {
+      cls: "codexidian-attach-file-input",
+      attr: { type: "file" },
+    });
+    this.imageFileInputEl.accept = "image/*";
+    this.imageFileInputEl.multiple = true;
 
     // Model + Effort toolbar
     const toolbarEl = footerEl.createDiv({ cls: "codexidian-toolbar" });
@@ -194,17 +230,53 @@ export class CodexidianView extends ItemView {
       void this.plugin.saveSettings();
     });
 
+    const skillGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
+    this.skillLabelEl = skillGroup.createSpan({ cls: "codexidian-toolbar-label", text: t("skill") });
+    this.skillMenuBtn = skillGroup.createEl("button", {
+      cls: "codexidian-toolbar-select codexidian-toolbar-menu-btn",
+      text: this.getSkillPresetLabel(this.plugin.settings.skillPreset),
+    });
+    this.skillMenuBtn.type = "button";
+    this.skillMenuBtn.addEventListener("click", (event) => {
+      void this.openSkillMenu(event);
+    });
+
+    const attachGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group codexidian-toolbar-attach-group" });
+    this.attachBtn = attachGroup.createEl("button", {
+      cls: "codexidian-attach-btn",
+      text: "📁",
+    });
+    this.attachBtn.type = "button";
+    this.attachBtn.setAttr("aria-label", t("attachImage"));
+    this.attachBtn.setAttr("title", t("attachImage"));
+
+    const modeGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
+    this.modeLabelEl = modeGroup.createSpan({ cls: "codexidian-toolbar-label", text: t("mode") });
+    this.modeMenuBtn = modeGroup.createEl("button", {
+      cls: "codexidian-toolbar-select codexidian-toolbar-menu-btn",
+      text: this.getApprovalModeLabel(this.plugin.settings.approvalMode),
+    });
+    this.modeMenuBtn.type = "button";
+    this.modeMenuBtn.addEventListener("click", (event) => {
+      this.openApprovalModeMenu(event);
+    });
+
     const actionsEl = footerEl.createDiv({ cls: "codexidian-actions" });
     this.sendHintEl = actionsEl.createDiv({ cls: "codexidian-hint", text: t("sendShortcutHint") });
     this.sendBtn = actionsEl.createEl("button", { text: t("send") });
     this.queueIndicatorEl = footerEl.createDiv({ cls: "codexidian-queue-indicator" });
     this.updateQueueIndicator();
+    this.dropZoneEl = this.rootEl.createDiv({ cls: "codexidian-drop-zone" });
+    this.dropZoneTextEl = this.dropZoneEl.createDiv({
+      cls: "codexidian-drop-zone-text",
+      text: t("dropImagesHere"),
+    });
 
     // Init TabBar
     this.tabBar = new TabBar(tabBarContainer, {
       maxTabs: this.plugin.settings.maxTabs,
       onSelect: (tabId) => this.tabManager.switchTo(tabId),
-      onClose: (tabId) => this.tabManager.closeTab(tabId),
+      onClose: (tabId) => this.closeTabWithReviewState(tabId),
       onAdd: () => this.createNewTab(),
     });
 
@@ -231,7 +303,13 @@ export class CodexidianView extends ItemView {
       this.fileContext = null;
     }
     try {
-      this.imageContext = new ImageContext(imagePreviewContainerEl, this.inputEl);
+      this.imageContext = new ImageContext(imagePreviewContainerEl, this.inputEl, {
+        dropTargetEl: this.rootEl,
+        onDropZoneActiveChange: (active) => this.setDropZoneActive(active),
+        onLimitReached: (max) => new Notice(tf("noticeAttachmentLimitReached", { max })),
+        onFilesIgnored: () => new Notice(t("noticeImageOnlyAttachments")),
+        onReadFailure: () => new Notice(t("noticeImageReadFailed")),
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       new Notice(tf("noticeImageContextInitFailed", { error: message }));
@@ -248,9 +326,13 @@ export class CodexidianView extends ItemView {
 
     try {
       await this.restoreTabsWithFallback();
+      this.ensureReviewStateForAllTabs();
+      this.ensurePlanStateForAllTabs();
       const activeTab = this.tabManager.getActiveTab();
       if (activeTab) {
         await this.ensureConversationReady(activeTab);
+        this.applyReviewStateToPane(activeTab.state.tabId);
+        this.renderPlanCardForTab(activeTab.state.tabId);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -269,6 +351,14 @@ export class CodexidianView extends ItemView {
         );
       }
     }
+
+    try {
+      await this.refreshAvailableSkills();
+    } catch (error) {
+      this.debugError("onOpen:refreshAvailableSkills", error);
+    }
+    this.updateSkillButtonText();
+    this.updateModeButtonText();
 
     this.bindEvents();
     this.updateStatus();
@@ -297,26 +387,48 @@ export class CodexidianView extends ItemView {
     this.messageRenderer?.destroy();
     this.statusPanel?.destroy();
     this.statusPanel = null;
+    this.reviewPane?.destroy();
+    this.reviewPane = null;
+    this.reviewStateByTabId.clear();
+    this.planStateByTabId.clear();
     this.tabManager?.destroy();
-    if (this.ctrlEnterHandler) {
-      document.removeEventListener("keydown", this.ctrlEnterHandler, true);
-      this.ctrlEnterHandler = null;
-    }
+    this.setDropZoneActive(false);
+    this.dropZoneTextEl = null;
+    this.dropZoneEl = null;
+    this.attachBtn = null;
+    this.imageFileInputEl = null;
   }
 
   private bindEvents(): void {
     this.sendBtn.addEventListener("click", () => {
       void this.sendCurrentInput().catch((error) => this.handleUnhandledSendError(error));
     });
+    this.attachBtn?.addEventListener("click", () => {
+      this.imageFileInputEl?.click();
+    });
+    this.imageFileInputEl?.addEventListener("change", () => {
+      const files = this.imageFileInputEl?.files;
+      if (!files || files.length === 0) {
+        return;
+      }
+      void this.handleImageFileSelection(files);
+      if (this.imageFileInputEl) {
+        this.imageFileInputEl.value = "";
+      }
+    });
     this.inputEl.addEventListener("input", () => {
       this.handleSlashInputChanged();
     });
 
     this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
-      if (e.key === "Enter") {
+      if (e.key === "Enter" || e.code === "Enter" || e.code === "NumpadEnter") {
         this.debugLog("Enter pressed", {
+          key: e.key,
+          code: e.code,
           ctrlKey: e.ctrlKey,
           metaKey: e.metaKey,
+          shiftKey: e.shiftKey,
+          isComposing: e.isComposing,
           slashMenuVisible: this.slashMenu?.isVisible() || false,
           running: this.running,
           inputDisabled: this.inputEl.disabled,
@@ -356,39 +468,42 @@ export class CodexidianView extends ItemView {
         void this.cancelCurrentStream();
         return;
       }
-    });
 
-    // Document-level capture to intercept Ctrl+Enter before Obsidian/Electron swallows it.
-    if (this.ctrlEnterHandler) {
-      document.removeEventListener("keydown", this.ctrlEnterHandler, true);
-    }
-    this.ctrlEnterHandler = (e: KeyboardEvent) => {
-      if (document.activeElement !== this.inputEl) return;
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        console.log("[CODEXIDIAN DEBUG] Ctrl+Enter captured at document level");
+      const isEnter = e.key === "Enter" || e.code === "Enter" || e.code === "NumpadEnter";
+      if (isEnter && !e.shiftKey && !e.isComposing) {
+        if (e.ctrlKey || e.metaKey) {
+          console.log("[CODEXIDIAN DEBUG] Ctrl+Enter captured in input keydown");
+        }
         e.preventDefault();
         e.stopPropagation();
-        e.stopImmediatePropagation();
-        void this.sendCurrentInput().catch((error) => this.handleUnhandledSendError(error));
-      }
-    };
-    document.addEventListener("keydown", this.ctrlEnterHandler, true);
-
-    // Backup handler managed by Obsidian lifecycle.
-    this.registerDomEvent(document, "keydown", (event: KeyboardEvent) => {
-      if (document.activeElement !== this.inputEl) return;
-      if (event.defaultPrevented) return;
-      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-        console.log("[CODEXIDIAN DEBUG] Ctrl+Enter captured via registerDomEvent");
-        event.preventDefault();
-        event.stopPropagation();
         void this.sendCurrentInput().catch((error) => this.handleUnhandledSendError(error));
       }
     });
 
     this.newThreadBtn.addEventListener("click", () => void this.startNewThread());
     this.restartBtn.addEventListener("click", () => void this.restartEngine());
-    this.historyBtn.addEventListener("click", () => this.toggleHistory());
+    this.historyBtn.addEventListener("click", () => this.openSessionModal());
+  }
+
+  private async handleImageFileSelection(files: FileList): Promise<void> {
+    try {
+      await this.imageContext?.addFiles(files);
+      this.inputEl.focus();
+    } catch (error) {
+      this.debugError("handleImageFileSelection", error);
+      new Notice(t("noticeImageReadFailed"));
+    }
+  }
+
+  private setDropZoneActive(active: boolean): void {
+    if (!this.dropZoneEl) {
+      return;
+    }
+    if (active) {
+      this.dropZoneEl.addClass("is-active");
+    } else {
+      this.dropZoneEl.removeClass("is-active");
+    }
   }
 
   private registerBuiltinSlashCommands(): void {
@@ -457,7 +572,7 @@ export class CodexidianView extends ItemView {
       description: t("cmdHistoryDesc"),
       icon: "🕘",
       execute: () => {
-        this.toggleHistory();
+        this.openSessionModal();
       },
     });
 
@@ -541,6 +656,9 @@ export class CodexidianView extends ItemView {
     tab.panelEl.empty();
     tab.conversationController.setMessages([]);
     this.statusPanel?.clear();
+    this.setReviewStateForTab(tab.state.tabId, []);
+    this.setPlanForTab(tab.state.tabId, null);
+    this.reviewPane?.clearComments();
     new Notice(t("noticeClearedConversation"));
   }
 
@@ -569,6 +687,87 @@ export class CodexidianView extends ItemView {
     await this.plugin.saveSettings();
     this.updateStatus();
     new Notice(tf("noticeEffortSet", { effort: nextOption.label }));
+  }
+
+  private async refreshAvailableSkills(): Promise<void> {
+    try {
+      this.availableSkills = await this.plugin.refreshAvailableSkills();
+    } catch {
+      this.availableSkills = this.plugin.getAvailableSkills();
+    }
+  }
+
+  private getSkillPresetLabel(value: SkillPreset): string {
+    const normalized = value.trim();
+    if (!normalized || normalized === "none") {
+      return t("skillPresetNone");
+    }
+    return normalized;
+  }
+
+  private getApprovalModeLabel(value: ApprovalMode): string {
+    const found = APPROVAL_MODES.find((mode) => mode.value === value);
+    return found?.label ?? "Prompt";
+  }
+
+  private updateSkillButtonText(): void {
+    if (!this.skillMenuBtn) return;
+    this.skillMenuBtn.setText(this.getSkillPresetLabel(this.plugin.settings.skillPreset));
+  }
+
+  private updateModeButtonText(): void {
+    if (!this.modeMenuBtn) return;
+    this.modeMenuBtn.setText(this.getApprovalModeLabel(this.plugin.settings.approvalMode));
+  }
+
+  private async openSkillMenu(event: MouseEvent): Promise<void> {
+    await this.refreshAvailableSkills();
+    const menu = new Menu();
+    const options: string[] = ["none", ...this.availableSkills];
+    if (
+      this.plugin.settings.skillPreset !== "none"
+      && this.plugin.settings.skillPreset.trim().length > 0
+      && !options.includes(this.plugin.settings.skillPreset)
+    ) {
+      options.push(this.plugin.settings.skillPreset);
+    }
+
+    for (const preset of options) {
+      const label = this.getSkillPresetLabel(preset);
+      menu.addItem((item) => {
+        item.setTitle(label);
+        if (this.plugin.settings.skillPreset === preset) {
+          item.setChecked(true);
+        }
+        item.onClick(() => {
+          this.plugin.settings.skillPreset = preset;
+          this.updateSkillButtonText();
+          void this.plugin.saveSettings();
+          new Notice(tf("noticeSkillSet", { skill: label }));
+        });
+      });
+    }
+    menu.showAtMouseEvent(event);
+  }
+
+  private openApprovalModeMenu(event: MouseEvent): void {
+    const menu = new Menu();
+    for (const mode of APPROVAL_MODES) {
+      const label = `${mode.label} (${mode.description})`;
+      menu.addItem((item) => {
+        item.setTitle(label);
+        if (this.plugin.settings.approvalMode === mode.value) {
+          item.setChecked(true);
+        }
+        item.onClick(() => {
+          this.plugin.settings.approvalMode = mode.value;
+          this.updateModeButtonText();
+          void this.plugin.saveSettings();
+          new Notice(tf("noticeCollaborationModeSet", { mode: mode.label }));
+        });
+      });
+    }
+    menu.showAtMouseEvent(event);
   }
 
   private showTabsSummary(): void {
@@ -677,8 +876,226 @@ export class CodexidianView extends ItemView {
     }
   }
 
+  private closeTabWithReviewState(tabId: string): void {
+    this.tabManager.closeTab(tabId);
+    this.reviewStateByTabId.delete(tabId);
+    this.planStateByTabId.delete(tabId);
+    const activeTabId = this.tabManager.getActiveTab()?.state.tabId;
+    if (activeTabId) {
+      this.applyReviewStateToPane(activeTabId);
+      this.renderPlanCardForTab(activeTabId);
+    } else {
+      this.reviewPane?.clear();
+    }
+  }
+
+  private ensureReviewStateForAllTabs(): void {
+    for (const state of this.tabManager.getAllTabStates()) {
+      this.ensureReviewState(state.tabId);
+    }
+  }
+
+  private ensurePlanStateForAllTabs(): void {
+    for (const state of this.tabManager.getAllTabStates()) {
+      this.ensurePlanState(state.tabId);
+    }
+  }
+
+  private ensureReviewState(tabId: string): ReviewTabState {
+    const existing = this.reviewStateByTabId.get(tabId);
+    if (existing) {
+      return existing;
+    }
+    const created: ReviewTabState = { diffs: [], comments: [] };
+    this.reviewStateByTabId.set(tabId, created);
+    return created;
+  }
+
+  private ensurePlanState(tabId: string): PlanUpdate | null {
+    if (this.planStateByTabId.has(tabId)) {
+      return this.planStateByTabId.get(tabId) ?? null;
+    }
+    this.planStateByTabId.set(tabId, null);
+    return null;
+  }
+
+  private applyReviewStateToPane(tabId: string): void {
+    const state = this.ensureReviewState(tabId);
+    if (!this.reviewPane) {
+      return;
+    }
+    const comments = state.comments.map((comment) => ({ ...comment }));
+    this.reviewPane.setDiffs(state.diffs);
+    this.reviewPane.clearComments();
+    for (const comment of comments) {
+      this.reviewPane.addComment(comment);
+    }
+  }
+
+  private setReviewStateForTab(tabId: string, diffs: DiffEntry[]): void {
+    const state = this.ensureReviewState(tabId);
+    state.diffs = diffs.map((entry) => ({ ...entry }));
+    if (this.tabManager.getActiveTab()?.state.tabId === tabId) {
+      this.reviewPane?.setDiffs(state.diffs);
+    }
+  }
+
+  private handleReviewCommentsChanged(comments: ReviewComment[]): void {
+    const tab = this.tabManager.getActiveTab();
+    if (!tab) {
+      return;
+    }
+    const state = this.ensureReviewState(tab.state.tabId);
+    state.comments = comments.map((comment) => ({ ...comment }));
+  }
+
+  private consumeReviewCommentsForActiveTab(): ReviewComment[] {
+    const tab = this.tabManager.getActiveTab();
+    if (!tab) {
+      return [];
+    }
+    const state = this.ensureReviewState(tab.state.tabId);
+    const comments = state.comments.map((comment) => ({ ...comment }));
+    state.comments = [];
+    if (this.reviewPane && tab.state.tabId === this.tabManager.getActiveTab()?.state.tabId) {
+      this.reviewPane.clearComments();
+    }
+    return comments;
+  }
+
+  private setPlanForTab(tabId: string, plan: PlanUpdate | null): void {
+    this.planStateByTabId.set(tabId, plan ? this.clonePlan(plan) : null);
+    this.renderPlanCardForTab(tabId);
+  }
+
+  private getPlanForTab(tabId: string): PlanUpdate | null {
+    return this.planStateByTabId.get(tabId) ?? null;
+  }
+
+  private clonePlan(plan: PlanUpdate): PlanUpdate {
+    return {
+      ...plan,
+      steps: plan.steps.map((step) => ({ ...step })),
+    };
+  }
+
+  private getOrCreatePlanCardHost(panelEl: HTMLElement): HTMLElement {
+    const existing = panelEl.querySelector<HTMLElement>(".codexidian-plan-card-host");
+    if (existing) {
+      return existing;
+    }
+    return panelEl.createDiv({ cls: "codexidian-plan-card-host" });
+  }
+
+  private renderPlanCardForTab(tabId: string): void {
+    const tab = this.tabManager.getTab(tabId);
+    if (!tab) return;
+
+    const hostEl = this.getOrCreatePlanCardHost(tab.panelEl);
+    const plan = this.getPlanForTab(tabId);
+    if (!plan) {
+      hostEl.empty();
+      hostEl.remove();
+      return;
+    }
+
+    PlanCardRenderer.render(hostEl, plan, {
+      onApproveAll: async () => {
+        await this.handlePlanApproveAll(tabId);
+      },
+      onGiveFeedback: async () => {
+        await this.handlePlanFeedback(tabId);
+      },
+      onExecuteNext: async () => {
+        await this.handlePlanExecuteNext(tabId);
+      },
+    });
+  }
+
+  private updatePlanForTab(tabId: string, updater: (plan: PlanUpdate) => void): void {
+    const current = this.getPlanForTab(tabId);
+    if (!current) return;
+    const next = this.clonePlan(current);
+    updater(next);
+    this.setPlanForTab(tabId, next);
+  }
+
+  private async handlePlanApproveAll(tabId: string): Promise<void> {
+    this.updatePlanForTab(tabId, (plan) => {
+      plan.status = "approved";
+      for (const step of plan.steps) {
+        if (step.status === "pending") {
+          step.status = "approved";
+        }
+      }
+    });
+
+    try {
+      await this.sendCurrentInput(t("planApprovedProceedMessage"));
+    } catch (error) {
+      this.debugError("handlePlanApproveAll", error, { tabId });
+    }
+  }
+
+  private async handlePlanFeedback(tabId: string): Promise<void> {
+    const feedback = window.prompt(t("planFeedbackPrompt"), "");
+    if (feedback === null) return;
+    const trimmed = feedback.trim();
+    if (!trimmed) return;
+
+    const text = `${t("planFeedbackMessagePrefix")}:\n${trimmed}`;
+    try {
+      await this.sendCurrentInput(text);
+    } catch (error) {
+      this.debugError("handlePlanFeedback", error, { tabId });
+    }
+  }
+
+  private async handlePlanExecuteNext(tabId: string): Promise<void> {
+    const plan = this.getPlanForTab(tabId);
+    if (!plan) return;
+
+    const nextStep = plan.steps.find((step) => step.status === "approved" || step.status === "pending");
+    if (!nextStep) return;
+
+    this.updatePlanForTab(tabId, (draft) => {
+      const target = draft.steps.find((step) => step.id === nextStep.id);
+      if (!target) return;
+      target.status = "executing";
+      if (draft.status !== "completed") {
+        draft.status = "in_progress";
+      }
+    });
+
+    try {
+      await this.sendCurrentInput(tf("planExecuteStepMessage", {
+        index: nextStep.index,
+        description: nextStep.description,
+      }));
+
+      this.updatePlanForTab(tabId, (draft) => {
+        const target = draft.steps.find((step) => step.id === nextStep.id);
+        if (!target) return;
+        target.status = "completed";
+        const hasRemaining = draft.steps.some((step) => (
+          step.status === "approved" || step.status === "pending" || step.status === "executing"
+        ));
+        draft.status = hasRemaining ? "in_progress" : "completed";
+      });
+    } catch (error) {
+      this.debugError("handlePlanExecuteNext", error, { tabId, stepId: nextStep.id });
+      this.updatePlanForTab(tabId, (draft) => {
+        const target = draft.steps.find((step) => step.id === nextStep.id);
+        if (!target) return;
+        target.status = "failed";
+      });
+    }
+  }
+
   private async createNewTab(): Promise<void> {
     const tab = this.tabManager.addTab();
+    this.ensureReviewState(tab.state.tabId);
+    this.ensurePlanState(tab.state.tabId);
     try {
       const conv = await tab.conversationController.createNew();
       this.tabManager.setConversationId(tab.state.tabId, conv.id);
@@ -716,6 +1133,10 @@ export class CodexidianView extends ItemView {
   }
 
   private onTabSwitched(tab: Tab): void {
+    this.ensureReviewState(tab.state.tabId);
+    this.applyReviewStateToPane(tab.state.tabId);
+    this.ensurePlanState(tab.state.tabId);
+    this.renderPlanCardForTab(tab.state.tabId);
     this.updateStatus();
     // Scroll to bottom of active panel
     tab.panelEl.scrollTop = tab.panelEl.scrollHeight;
@@ -877,26 +1298,34 @@ export class CodexidianView extends ItemView {
       this.debugError("sendCurrentInput:imageContext-failed", error);
       imageAttachments = [];
     }
-    const imageLines = imageAttachments.map((image) => (
-      tf("imageAttached", { name: image.name || "pasted-image" })
-    ));
-    const promptWithImages = imageLines.length > 0
-      ? `${prompt}\n\n${imageLines.join("\n")}`
-      : prompt;
-    let augmented = promptWithImages;
+    const imageInputs = imageAttachments
+      .map((image) => ({
+        name: image.name,
+        dataUrl: typeof image.dataUrl === "string" ? image.dataUrl.trim() : "",
+      }))
+      .filter((image) => image.dataUrl.length > 0);
+    const reviewComments = this.consumeReviewCommentsForActiveTab();
+    const promptWithTurnControls = this.buildPromptWithTurnControls(prompt);
+    const promptWithReviewComments = this.appendReviewCommentsToPrompt(promptWithTurnControls, reviewComments);
+    let augmented = promptWithReviewComments;
     try {
-      augmented = buildAugmentedPrompt(promptWithImages, notePath, editorCtx, allContextFiles);
+      augmented = buildAugmentedPrompt(promptWithReviewComments, notePath, editorCtx, allContextFiles);
     } catch (error) {
       this.debugError("sendCurrentInput:buildAugmentedPrompt-failed", error);
-      augmented = promptWithImages;
+      augmented = promptWithReviewComments;
     }
 
     this.debugLog("sendCurrentInput:prompt-ready", {
       promptLength: prompt.length,
+      promptWithControlsLength: promptWithTurnControls.length,
+      promptWithReviewCommentsLength: promptWithReviewComments.length,
       augmentedLength: augmented.length,
       attachedFiles: attachedFiles.length,
       mcpContextFiles: mcpContextFiles.length,
       imageAttachments: imageAttachments.length,
+      reviewComments: reviewComments.length,
+      skillPreset: this.plugin.settings.skillPreset,
+      approvalMode: this.plugin.settings.approvalMode,
       notePath,
     });
 
@@ -920,6 +1349,10 @@ export class CodexidianView extends ItemView {
     let thinkingBlock: ThinkingBlockHandle | null = null;
     let thinkingFinalized = false;
     const toolStartTimes = new Map<string, number>();
+    const toolMetadataById = new Map<string, Partial<ToolStartInfo>>();
+    const toolOutputById = new Map<string, string>();
+    const turnDiffsByPath = new Map<string, DiffEntry>();
+    let detectedPlanFromTool: PlanUpdate | null = null;
     let thinkingEntryId: string | null = null;
     let thinkingStartedAt = 0;
 
@@ -989,6 +1422,7 @@ export class CodexidianView extends ItemView {
         tabId: tab.state.tabId,
         model: this.modelSelect.value || "(default)",
         effort: this.effortSelect.value || "(default)",
+        imageInputs: imageInputs.length,
       });
       const turnPromise = this.plugin.client.sendTurn(
         augmented,
@@ -1040,6 +1474,12 @@ export class CodexidianView extends ItemView {
             activeToolItemId = info.itemId;
             card.complete("running");
             toolStartTimes.set(info.itemId, Date.now());
+            toolMetadataById.set(info.itemId, {
+              type: info.type,
+              name: info.name,
+              command: info.command,
+              filePath: info.filePath,
+            });
             this.statusPanel?.setTurnStatus("tool_calling");
             this.statusPanel?.addEntry({
               id: info.itemId,
@@ -1069,6 +1509,8 @@ export class CodexidianView extends ItemView {
               }
               const card = ensureToolCard(itemId, { type: "tool", name: t("toolOutput") });
               card.appendOutput(delta);
+              const previous = toolOutputById.get(itemId) ?? "";
+              toolOutputById.set(itemId, `${previous}${delta}`);
             }
 
             if (delta.trim().length > 0) {
@@ -1093,6 +1535,18 @@ export class CodexidianView extends ItemView {
               const remaining = Array.from(runningToolIds);
               activeToolItemId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
             }
+
+            const metadata = toolMetadataById.get(info.itemId);
+            const diffEntry = this.inferDiffEntryFromTool(info, metadata);
+            if (diffEntry) {
+              turnDiffsByPath.set(diffEntry.filePath.toLowerCase(), diffEntry);
+            }
+            if (!detectedPlanFromTool) {
+              detectedPlanFromTool = this.detectPlanFromToolOutput(
+                info,
+                toolOutputById.get(info.itemId) ?? "",
+              );
+            }
             tab.panelEl.scrollTop = tab.panelEl.scrollHeight;
           },
           onSystem: (message) => {
@@ -1106,6 +1560,7 @@ export class CodexidianView extends ItemView {
         {
           model: this.modelSelect.value || undefined,
           effort: this.effortSelect.value || undefined,
+          images: imageInputs.length > 0 ? imageInputs : undefined,
         },
       );
       const captureTurnId = () => {
@@ -1157,6 +1612,14 @@ export class CodexidianView extends ItemView {
           suffix,
         }));
       }
+
+      if (result.status === "completed") {
+        this.setReviewStateForTab(tab.state.tabId, Array.from(turnDiffsByPath.values()));
+        const planCandidate = detectedPlanFromTool ?? this.detectPlanFromAssistantText(accumulated);
+        if (planCandidate) {
+          this.setPlanForTab(tab.state.tabId, planCandidate);
+        }
+      }
     } catch (error) {
       this.debugError("sendCurrentInput:onError", error, { sendSeq });
       const cancelledByUser = this.cancelledSendSequences.has(sendSeq);
@@ -1179,6 +1642,10 @@ export class CodexidianView extends ItemView {
       } else {
         await this.messageRenderer.renderContent(assistantEl, t("messageNoAssistantOutput"));
         this.appendSystemMessageToPanel(tab.panelEl, tf("messageRequestFailed", { error: message }));
+        if (imageInputs.length > 0 && this.isImageInputUnsupportedMessage(message)) {
+          this.appendSystemMessageToPanel(tab.panelEl, t("messageImageUploadUnsupported"));
+          new Notice(t("noticeImageUploadUnsupported"));
+        }
         new Notice(tf("noticeCodexError", { error: message }));
         finalizeThinking();
       }
@@ -1213,6 +1680,38 @@ export class CodexidianView extends ItemView {
         new Notice(tf("noticeProcessQueueFailed", { error: message }));
       }
     }
+  }
+
+  private buildPromptWithTurnControls(prompt: string): string {
+    const directives: string[] = [];
+    const skill = this.plugin.settings.skillPreset.trim();
+    if (skill && skill !== "none") {
+      directives.push(`[Skill: ${skill}]`);
+    }
+    if (directives.length === 0) {
+      return prompt;
+    }
+    return `${directives.join("\n")}\n\n${prompt}`;
+  }
+
+  private appendReviewCommentsToPrompt(prompt: string, comments: ReviewComment[]): string {
+    if (comments.length === 0) {
+      return prompt;
+    }
+
+    const lines = comments
+      .map((comment) => {
+        const scope = comment.scope.trim() || "general";
+        const text = comment.text.trim();
+        return text ? `- ${scope}: ${text}` : "";
+      })
+      .filter((line) => line.length > 0);
+
+    if (lines.length === 0) {
+      return prompt;
+    }
+
+    return `${prompt}\n\n[${t("reviewPromptHeader")}]\n${lines.join("\n")}`;
   }
 
   private async startNewThread(): Promise<void> {
@@ -1256,61 +1755,73 @@ export class CodexidianView extends ItemView {
     }
   }
 
-  private toggleHistory(): void {
-    this.historyOpen = !this.historyOpen;
-    if (this.historyOpen) {
-      void this.renderHistoryMenu();
-      this.historyMenuEl.style.display = "block";
-    } else {
-      this.historyMenuEl.style.display = "none";
+  private openSessionModal(): void {
+    try {
+      const modal = new SessionModal(this.app, {
+        listConversations: async (filter) => await this.listConversations(filter),
+        searchConversations: async (query, filter) => await this.searchConversations(query, filter),
+        onOpen: async (meta) => await this.openConversation(meta.id),
+        onFork: async (meta) => await this.forkConversation(meta.id),
+        onTogglePin: async (meta, pinned) => {
+          await this.updateConversationMeta(meta.id, { pinned });
+        },
+        onToggleArchive: async (meta, archived) => {
+          await this.updateConversationMeta(meta.id, { archived });
+        },
+        onDelete: async (meta) => {
+          await this.deleteConversation(meta.id);
+        },
+      });
+      modal.open();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      new Notice(tf("sessionActionFailed", { error: message }));
     }
   }
 
-  private async renderHistoryMenu(): Promise<void> {
-    this.historyMenuEl.empty();
-    const cc = this.tabManager.getActiveConversationController();
-    if (!cc) return;
-
-    const list = await cc.listConversations();
-    if (list.length === 0) {
-      this.historyMenuEl.createDiv({ cls: "codexidian-history-empty", text: t("historyEmpty") });
-      return;
+  private getAnyConversationController(): ConversationController | null {
+    const active = this.tabManager.getActiveConversationController();
+    if (active) {
+      return active;
     }
-
-    for (const meta of list) {
-      this.renderHistoryItem(meta);
+    for (const state of this.tabManager.getAllTabStates()) {
+      const tab = this.tabManager.getTab(state.tabId);
+      if (tab) {
+        return tab.conversationController;
+      }
     }
+    return null;
   }
 
-  private renderHistoryItem(meta: ConversationMeta): void {
-    const item = this.historyMenuEl.createDiv({ cls: "codexidian-history-item" });
-    const titleEl = item.createSpan({ cls: "codexidian-history-title" });
-    titleEl.setText(meta.title);
-    titleEl.title = `${tf("historyMessageCount", { count: meta.messageCount })}\n${meta.preview}`;
+  private async listConversations(filter: ConversationListFilter): Promise<ConversationMeta[]> {
+    const controller = this.getAnyConversationController();
+    if (controller) {
+      return await controller.listConversations(filter);
+    }
+    return await this.sessionStorage.listConversations(filter);
+  }
 
-    const actions = item.createDiv({ cls: "codexidian-history-actions" });
+  private async searchConversations(query: string, filter: ConversationListFilter): Promise<ConversationMeta[]> {
+    const controller = this.getAnyConversationController();
+    if (controller) {
+      return await controller.searchConversations(query, filter);
+    }
+    return await this.sessionStorage.searchConversations(query, filter);
+  }
 
-    const openBtn = actions.createEl("button", { cls: "codexidian-history-action-btn", text: t("open") });
-    openBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void this.openConversation(meta.id);
-      this.toggleHistory();
-    });
-
-    const deleteBtn = actions.createEl("button", { cls: "codexidian-history-action-btn delete", text: t("del") });
-    deleteBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void this.deleteConversation(meta.id);
-    });
-
-    item.addEventListener("click", () => {
-      void this.openConversation(meta.id);
-      this.toggleHistory();
-    });
+  private async updateConversationMeta(
+    id: string,
+    partial: Partial<Pick<ConversationMeta, "archived" | "pinned" | "tags">>,
+  ): Promise<ConversationMeta | null> {
+    const controller = this.getAnyConversationController();
+    if (controller) {
+      return await controller.updateMeta(id, partial);
+    }
+    return await this.sessionStorage.updateMeta(id, partial);
   }
 
   private async openConversation(id: string): Promise<void> {
-    const tab = this.tabManager.getActiveTab();
+    const tab = await this.ensureActiveTabForInlineCard();
     if (!tab) return;
 
     const conv = await tab.conversationController.switchTo(id);
@@ -1321,22 +1832,79 @@ export class CodexidianView extends ItemView {
 
     this.tabManager.setConversationId(tab.state.tabId, id);
     tab.panelEl.empty();
+    this.setReviewStateForTab(tab.state.tabId, []);
+    this.setPlanForTab(tab.state.tabId, null);
 
     await this.renderConversationMessages(tab.panelEl, conv.messages);
 
-    if (conv.threadId) {
-      this.plugin.client.setThreadId(conv.threadId);
-    }
+    this.plugin.client.setThreadId(conv.threadId ?? null);
 
     this.updateStatus();
     tab.panelEl.scrollTop = tab.panelEl.scrollHeight;
   }
 
   private async deleteConversation(id: string): Promise<void> {
-    const cc = this.tabManager.getActiveConversationController();
-    if (!cc) return;
-    await cc.deleteConversation(id);
-    void this.renderHistoryMenu();
+    const controller = this.getAnyConversationController();
+    if (controller) {
+      await controller.deleteConversation(id);
+    } else {
+      await this.sessionStorage.deleteConversation(id);
+    }
+
+    const activeTab = this.tabManager.getActiveTab();
+    if (!activeTab) return;
+    if (activeTab.state.conversationId !== id) return;
+
+    activeTab.panelEl.empty();
+    this.tabManager.setConversationId(activeTab.state.tabId, null);
+    this.setReviewStateForTab(activeTab.state.tabId, []);
+    this.setPlanForTab(activeTab.state.tabId, null);
+    const ready = await this.ensureConversationReady(activeTab);
+    if (ready) {
+      this.appendSystemMessageToPanel(activeTab.panelEl, t("messageReadyHint"));
+    }
+  }
+
+  private async forkConversation(id: string): Promise<void> {
+    if (this.running) {
+      new Notice(t("noticeCannotForkRunning"));
+      return;
+    }
+
+    const currentTabCount = this.tabManager.getAllTabStates().length;
+    if (currentTabCount >= this.plugin.settings.maxTabs) {
+      new Notice(tf("noticeCannotForkMax", { max: this.plugin.settings.maxTabs }));
+      return;
+    }
+
+    const sourceConversation = await this.sessionStorage.loadConversation(id);
+    if (!sourceConversation) {
+      new Notice(t("noticeFailedLoadConversation"));
+      return;
+    }
+
+    const forkTab = this.tabManager.addTab();
+    this.ensureReviewState(forkTab.state.tabId);
+    this.ensurePlanState(forkTab.state.tabId);
+    const forkTitle = `${t("sessionForkPrefix")} ${sourceConversation.title}`;
+    const forkConv = await forkTab.conversationController.createNew(forkTitle);
+    this.tabManager.setConversationId(forkTab.state.tabId, forkConv.id);
+    forkTab.conversationController.setMessages(sourceConversation.messages);
+
+    forkTab.panelEl.empty();
+    await this.renderConversationMessages(forkTab.panelEl, sourceConversation.messages);
+
+    try {
+      const threadId = await this.plugin.client.newThread();
+      forkTab.conversationController.setThreadId(threadId);
+      this.appendSystemMessageToPanel(forkTab.panelEl, t("messageForkCreated"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendSystemMessageToPanel(forkTab.panelEl, tf("messageForkThreadFail", { error: message }));
+    }
+
+    this.tabManager.switchTo(forkTab.state.tabId);
+    this.updateStatus();
   }
 
   private async renderConversationMessages(panelEl: HTMLElement, messages: ChatMessage[]): Promise<void> {
@@ -1813,6 +2381,8 @@ export class CodexidianView extends ItemView {
       }
 
       const forkTab = this.tabManager.addTab();
+      this.ensureReviewState(forkTab.state.tabId);
+      this.ensurePlanState(forkTab.state.tabId);
       const forkConv = await forkTab.conversationController.createNew(`Fork ${new Date().toLocaleString()}`);
       this.tabManager.setConversationId(forkTab.state.tabId, forkConv.id);
       forkTab.conversationController.setMessages(branchMessages);
@@ -1869,14 +2439,24 @@ export class CodexidianView extends ItemView {
     this.inputEl.placeholder = t("askPlaceholder");
     this.modelLabelEl?.setText(t("model"));
     this.effortLabelEl?.setText(t("effort"));
+    this.skillLabelEl?.setText(t("skill"));
+    this.modeLabelEl?.setText(t("mode"));
+    this.updateSkillButtonText();
+    this.updateModeButtonText();
+    if (this.attachBtn) {
+      this.attachBtn.setAttr("aria-label", t("attachImage"));
+      this.attachBtn.setAttr("title", t("attachImage"));
+    }
+    this.dropZoneTextEl?.setText(t("dropImagesHere"));
     this.sendHintEl?.setText(t("sendShortcutHint"));
     this.sendBtn?.setText(t("send"));
     this.updateNoteContextToggle();
     this.registerBuiltinSlashCommands();
-    if (this.historyOpen) {
-      void this.renderHistoryMenu();
-    }
     this.statusPanel?.refreshLocale();
+    this.reviewPane?.refreshLocale();
+    for (const state of this.tabManager?.getAllTabStates() ?? []) {
+      this.renderPlanCardForTab(state.tabId);
+    }
     this.updateQueueIndicator();
     this.updateStatus();
   }
@@ -2018,6 +2598,10 @@ export class CodexidianView extends ItemView {
       cls: "codexidian-approval-btn approve",
       text: t("approve"),
     });
+    const alwaysBtn = actionsEl.createEl("button", {
+      cls: "codexidian-approval-btn codexidian-approval-always-btn",
+      text: t("alwaysAllow"),
+    });
     const denyBtn = actionsEl.createEl("button", {
       cls: "codexidian-approval-btn deny",
       text: t("deny"),
@@ -2038,6 +2622,7 @@ export class CodexidianView extends ItemView {
         window.clearTimeout(timer);
 
         approveBtn.disabled = true;
+        alwaysBtn.disabled = true;
         denyBtn.disabled = true;
         cardEl.addClass("codexidian-approval-card-readonly");
         cardEl.addClass(decision === "accept" ? "codexidian-approval-accepted" : "codexidian-approval-denied");
@@ -2050,6 +2635,24 @@ export class CodexidianView extends ItemView {
       };
 
       approveBtn.addEventListener("click", () => settle("accept", t("approvalApproved")));
+      alwaysBtn.addEventListener("click", () => {
+        void (async () => {
+          try {
+            const result = await this.plugin.addAllowRuleFromApprovalRequest(request);
+            const typeLabel = this.getAllowRuleTypeLabel(result.ruleType);
+            if (result.status === "added") {
+              new Notice(tf("noticeAllowRuleAdded", { type: typeLabel, pattern: result.pattern }));
+            } else if (result.status === "exists") {
+              new Notice(tf("noticeAllowRuleExists", { type: typeLabel, pattern: result.pattern }));
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(tf("noticeAllowRuleAddFailed", { error: message }));
+          } finally {
+            settle("accept", t("approvalAlwaysAllowed"));
+          }
+        })();
+      });
       denyBtn.addEventListener("click", () => settle("decline", t("approvalDenied")));
     });
   }
@@ -2278,6 +2881,281 @@ export class CodexidianView extends ItemView {
     return t("approvalTitleGeneric");
   }
 
+  private detectPlanFromToolOutput(info: ToolCompleteInfo, output: string): PlanUpdate | null {
+    const signature = `${info.type || ""} ${info.name || ""}`.toLowerCase();
+    const likelyPlanTool = signature.includes("plan");
+    if (!likelyPlanTool && !output.trim()) {
+      return null;
+    }
+
+    const parsed = this.parseStructuredPlan(output);
+    if (parsed) {
+      return parsed;
+    }
+    if (!likelyPlanTool) {
+      return null;
+    }
+    return this.detectPlanFromAssistantText(output);
+  }
+
+  private detectPlanFromAssistantText(content: string): PlanUpdate | null {
+    const markdownPlan = this.parseMarkdownPlan(content);
+    if (markdownPlan) {
+      return markdownPlan;
+    }
+    return this.parseStructuredPlan(content);
+  }
+
+  private parseStructuredPlan(raw: unknown): PlanUpdate | null {
+    const parsedValue = this.parseUnknownJson(raw);
+    if (!parsedValue || typeof parsedValue !== "object") {
+      return null;
+    }
+
+    const record = parsedValue as Record<string, unknown>;
+    const candidate = (record.plan && typeof record.plan === "object") ? record.plan as Record<string, unknown> : record;
+    const rawSteps = Array.isArray(candidate.steps) ? candidate.steps : [];
+    if (rawSteps.length === 0) {
+      return null;
+    }
+
+    const steps: PlanStep[] = [];
+    for (let index = 0; index < rawSteps.length; index++) {
+      const rawStep = rawSteps[index];
+      if (typeof rawStep === "string") {
+        const text = rawStep.trim();
+        if (!text) continue;
+        steps.push({
+          id: `plan-step-${index + 1}`,
+          index: index + 1,
+          description: text,
+          status: "pending",
+        });
+        continue;
+      }
+
+      if (!rawStep || typeof rawStep !== "object") continue;
+      const stepObj = rawStep as Record<string, unknown>;
+      const descriptionCandidate = (
+        stepObj.description
+        ?? stepObj.text
+        ?? stepObj.title
+      );
+      const description = typeof descriptionCandidate === "string" ? descriptionCandidate.trim() : "";
+      if (!description) continue;
+      const rawStatus = typeof stepObj.status === "string" ? stepObj.status : "pending";
+      const rawId = typeof stepObj.id === "string" ? stepObj.id.trim() : "";
+      steps.push({
+        id: rawId || `plan-step-${index + 1}`,
+        index: index + 1,
+        description,
+        status: this.normalizePlanStepStatus(rawStatus),
+      });
+    }
+
+    if (steps.length === 0) {
+      return null;
+    }
+
+    const rawTitle = (
+      candidate.title
+      ?? candidate.name
+      ?? candidate.summary
+    );
+    const title = typeof rawTitle === "string" && rawTitle.trim() ? rawTitle.trim() : t("planTitle");
+    const rawStatus = typeof candidate.status === "string" ? candidate.status : "proposed";
+    const rawPlanId = typeof candidate.planId === "string" ? candidate.planId : (
+      typeof candidate.id === "string" ? candidate.id : ""
+    );
+
+    return {
+      planId: rawPlanId.trim() || `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      steps,
+      status: this.normalizePlanStatus(rawStatus),
+    };
+  }
+
+  private parseMarkdownPlan(content: string): PlanUpdate | null {
+    if (!content || !content.trim()) return null;
+
+    const hasPlanHeading = /(^|\n)\s*#{2,4}\s*(plan|steps?)\b/i.test(content);
+    const lines = content.split(/\r?\n/);
+    const steps: PlanStep[] = [];
+
+    for (const line of lines) {
+      const numbered = line.match(/^\s*(\d+)[\.\)]\s+(.+)$/);
+      if (numbered) {
+        const description = numbered[2].trim();
+        if (description) {
+          steps.push({
+            id: `plan-step-${steps.length + 1}`,
+            index: steps.length + 1,
+            description,
+            status: "pending",
+          });
+        }
+        continue;
+      }
+
+      if (hasPlanHeading) {
+        const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+        if (bullet) {
+          const description = bullet[1].trim();
+          if (description) {
+            steps.push({
+              id: `plan-step-${steps.length + 1}`,
+              index: steps.length + 1,
+              description,
+              status: "pending",
+            });
+          }
+        }
+      }
+    }
+
+    const isValidPlan = hasPlanHeading ? steps.length >= 2 : steps.length >= 3;
+    if (!isValidPlan) {
+      return null;
+    }
+
+    return {
+      planId: `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title: t("planTitle"),
+      steps,
+      status: "proposed",
+    };
+  }
+
+  private parseUnknownJson(raw: unknown): unknown {
+    if (raw && typeof raw === "object") {
+      return raw;
+    }
+    if (typeof raw !== "string") {
+      return null;
+    }
+
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+
+    const candidates = [trimmed];
+    const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fencedMatch?.[1]) {
+      candidates.unshift(fencedMatch[1].trim());
+    }
+
+    for (const candidate of candidates) {
+      try {
+        return JSON.parse(candidate) as unknown;
+      } catch {
+        // Try next candidate.
+      }
+    }
+
+    return null;
+  }
+
+  private normalizePlanStatus(status: string): PlanUpdate["status"] {
+    const normalized = status.trim().toLowerCase();
+    if (normalized === "approved") return "approved";
+    if (normalized === "in_progress" || normalized === "inprogress" || normalized === "executing") return "in_progress";
+    if (normalized === "completed" || normalized === "done") return "completed";
+    return "proposed";
+  }
+
+  private normalizePlanStepStatus(status: string): PlanStep["status"] {
+    const normalized = status.trim().toLowerCase();
+    if (normalized === "approved") return "approved";
+    if (normalized === "executing" || normalized === "in_progress" || normalized === "inprogress") return "executing";
+    if (normalized === "completed" || normalized === "done") return "completed";
+    if (normalized === "failed" || normalized === "error") return "failed";
+    if (normalized === "skipped") return "skipped";
+    return "pending";
+  }
+
+  private inferDiffEntryFromTool(
+    completeInfo: ToolCompleteInfo,
+    startInfo?: Partial<ToolStartInfo>,
+  ): DiffEntry | null {
+    if (this.resolveEntryStatus(completeInfo.status) !== "completed") {
+      return null;
+    }
+
+    const type = (completeInfo.type || startInfo?.type || "").trim().toLowerCase();
+    const name = (completeInfo.name || startInfo?.name || "").trim();
+    const command = (completeInfo.command || startInfo?.command || "").trim();
+    const filePath = (
+      completeInfo.filePath
+      || startInfo?.filePath
+      || this.extractFilePathFromCommand(command)
+    )?.trim();
+
+    if (!filePath) {
+      return null;
+    }
+
+    const status = this.inferDiffStatusFromTool(type, name, command);
+    const summarySource = command || name || completeInfo.type;
+    return {
+      filePath,
+      status,
+      summary: this.truncateStatusDetail(summarySource),
+    };
+  }
+
+  private inferDiffStatusFromTool(
+    type: string,
+    name: string,
+    command: string,
+  ): DiffEntry["status"] {
+    const signature = `${type} ${name} ${command}`.toLowerCase();
+
+    if (
+      signature.includes("delete")
+      || signature.includes("remove")
+      || signature.includes("unlink")
+      || signature.includes(" rm ")
+    ) {
+      return "deleted";
+    }
+
+    if (
+      signature.includes("create")
+      || signature.includes("new_file")
+      || signature.includes("add_file")
+      || signature.includes("mkdir")
+      || signature.includes("touch ")
+    ) {
+      return "added";
+    }
+
+    return "modified";
+  }
+
+  private extractFilePathFromCommand(command: string): string | null {
+    if (!command) return null;
+
+    const quoted = command.match(/["']([^"']+\.[\w-]+)["']/);
+    if (quoted && quoted[1]) {
+      return normalizePath(quoted[1]);
+    }
+
+    const parts = command.split(/\s+/).map((part) => part.trim()).filter(Boolean);
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (!part) continue;
+      if (part.startsWith("-")) continue;
+      if (part.includes("/") || part.includes("\\")) {
+        return normalizePath(part.replace(/^['"]|['"]$/g, ""));
+      }
+      if (/\.[a-zA-Z0-9]{1,8}$/.test(part)) {
+        return normalizePath(part.replace(/^['"]|['"]$/g, ""));
+      }
+    }
+
+    return null;
+  }
+
   private resolveEntryStatus(status: string): "completed" | "failed" {
     const normalized = status.trim().toLowerCase();
     if (
@@ -2301,8 +3179,29 @@ export class CodexidianView extends ItemView {
     return `${compact.slice(0, 80)}...`;
   }
 
+  private getAllowRuleTypeLabel(type: "command" | "file_write" | "tool"): string {
+    if (type === "command") return t("allowRuleTypeCommand");
+    if (type === "file_write") return t("allowRuleTypeFileWrite");
+    return t("allowRuleTypeTool");
+  }
+
   private isThreadNotFoundMessage(message: string): boolean {
     return message.toLowerCase().includes("thread not found");
+  }
+
+  private isImageInputUnsupportedMessage(message: string): boolean {
+    const normalized = message.toLowerCase();
+    if (!normalized.includes("image")) {
+      return false;
+    }
+    return (
+      normalized.includes("unknown variant")
+      || normalized.includes("invalid")
+      || normalized.includes("failed to parse")
+      || normalized.includes("deserialize")
+      || normalized.includes("not supported")
+      || normalized.includes("unsupported")
+    );
   }
 
   private restoreStatusAfterInteractiveCard(): void {

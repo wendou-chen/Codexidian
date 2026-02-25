@@ -1,6 +1,11 @@
 import type { SessionStorage } from "../storage/SessionStorage";
 import type { MessageRenderer } from "../rendering/MessageRenderer";
-import type { Conversation, ChatMessage, ConversationMeta } from "../types";
+import type {
+  ChatMessage,
+  Conversation,
+  ConversationListFilter,
+  ConversationMeta,
+} from "../types";
 import { generateConversationId, generateMessageId } from "../types";
 
 const SAVE_DEBOUNCE_MS = 500;
@@ -154,8 +159,26 @@ export class ConversationController {
     }
   }
 
-  async listConversations(): Promise<ConversationMeta[]> {
-    return this.storage.listConversations();
+  async listConversations(filter: ConversationListFilter = "all"): Promise<ConversationMeta[]> {
+    return this.storage.listConversations(filter);
+  }
+
+  async searchConversations(query: string, filter: ConversationListFilter = "all"): Promise<ConversationMeta[]> {
+    return this.storage.searchConversations(query, filter);
+  }
+
+  async updateMeta(
+    id: string,
+    partial: Partial<Pick<ConversationMeta, "archived" | "pinned" | "tags">>,
+  ): Promise<ConversationMeta | null> {
+    const updated = await this.storage.updateMeta(id, partial);
+    if (updated && this.activeConversation?.id === id) {
+      this.activeConversation.updatedAt = updated.updatedAt;
+      this.activeConversation.archived = updated.archived === true;
+      this.activeConversation.pinned = updated.pinned === true;
+      this.activeConversation.tags = updated.tags ? [...updated.tags] : [];
+    }
+    return updated;
   }
 
   private scheduleSave(): void {

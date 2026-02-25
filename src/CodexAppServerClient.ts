@@ -180,12 +180,13 @@ export class CodexAppServerClient {
   async sendTurn(
     prompt: string,
     handlers: TurnHandlers = {},
-    options?: { model?: string; effort?: string },
+    options?: { model?: string; effort?: string; images?: Array<{ dataUrl: string }> },
   ): Promise<TurnResult> {
     this.debugLog("sendTurn:start", {
       promptLength: prompt.length,
       model: options?.model ?? null,
       effort: options?.effort ?? null,
+      imageCount: options?.images?.length ?? 0,
     });
     await this.start();
     let threadId = await this.ensureThread();
@@ -577,11 +578,19 @@ export class CodexAppServerClient {
   private buildTurnStartParams(
     threadId: string,
     prompt: string,
-    options?: { model?: string; effort?: string },
+    options?: { model?: string; effort?: string; images?: Array<{ dataUrl: string }> },
   ): Record<string, unknown> {
+    const imageInputs = (options?.images ?? [])
+      .map((image) => (typeof image?.dataUrl === "string" ? image.dataUrl.trim() : ""))
+      .filter((url) => url.length > 0)
+      .map((url) => ({ type: "image", url }));
+
     return {
       threadId,
-      input: [{ type: "text", text: prompt, text_elements: [] }],
+      input: [
+        ...imageInputs,
+        { type: "text", text: prompt, text_elements: [] },
+      ],
       cwd: null,
       approvalPolicy: null,
       sandboxPolicy: null,
@@ -712,7 +721,7 @@ export class CodexAppServerClient {
           cwd: this.extractApprovalCwd(message.params),
           params: message.params,
         };
-        const decision = await this.resolveApprovalDecision(approvalRequest, settings.autoApproveRequests);
+        const decision = await this.resolveApprovalDecision(approvalRequest);
 
         if (method === "execCommandApproval" || method === "applyPatchApproval") {
           result = { decision: decision === "accept" ? "approved" : "denied" };
@@ -791,15 +800,18 @@ export class CodexAppServerClient {
     return "applyPatch";
   }
 
-  private async resolveApprovalDecision(
-    request: ApprovalRequest,
-    autoApproveRequests: boolean,
-  ): Promise<ApprovalDecision> {
+  private async resolveApprovalDecision(request: ApprovalRequest): Promise<ApprovalDecision> {
     const requestSummary = this.buildApprovalSummary(request);
+    const { approvalMode } = this.getSettings();
 
-    if (autoApproveRequests) {
+    if (approvalMode === "yolo") {
       this.onSystemMessage(`[approval] Auto-approved ${requestSummary}`);
       return "accept";
+    }
+
+    if (approvalMode === "safe") {
+      this.onSystemMessage(`[approval] Auto-denied ${requestSummary}`);
+      return "decline";
     }
 
     if (this.onApprovalRequest) {
@@ -1113,6 +1125,9 @@ export class CodexAppServerClient {
             itemId,
             type: itemType || "tool",
             status: this.extractItemStatus(item, params),
+            name: this.extractToolName(item),
+            command: this.extractCommand(item),
+            filePath: this.extractFilePath(item),
           };
           this.emitToolComplete(turnId, info);
           if (this.turnActiveToolItemId.get(turnId) === itemId) {
