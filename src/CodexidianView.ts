@@ -192,18 +192,13 @@ export class CodexidianView extends ItemView {
     const footerEl = this.rootEl.createDiv({ cls: "codexidian-footer" });
     const fileChipContainerEl = footerEl.createDiv({ cls: "codexidian-file-chips-container" });
     const imagePreviewContainerEl = footerEl.createDiv({ cls: "codexidian-image-previews-container" });
-    const inputRowEl = footerEl.createDiv({ cls: "codexidian-input-row" });
-    const inputWrapEl = inputRowEl.createDiv({ cls: "codexidian-input-wrap" });
+    const inputWrapEl = footerEl.createDiv({ cls: "codexidian-input-wrapper" });
     this.inputEl = inputWrapEl.createEl("textarea", { cls: "codexidian-input" });
     this.inputEl.placeholder = t("askPlaceholder");
-    this.sendBtn = inputRowEl.createEl("button", { cls: "codexidian-send-btn", text: t("send") });
-    this.sendBtn.type = "button";
-    this.sendBtn.setAttribute("aria-label", t("send"));
-    this.sendBtn.setAttribute("title", t("send"));
     this.slashMenu = new SlashCommandMenu(inputWrapEl);
     this.registerBuiltinSlashCommands();
 
-    this.imageFileInputEl = inputRowEl.createEl("input", {
+    this.imageFileInputEl = footerEl.createEl("input", {
       cls: "codexidian-attach-file-input",
       attr: { type: "file" },
     });
@@ -267,6 +262,11 @@ export class CodexidianView extends ItemView {
     this.modeMenuBtn.addEventListener("click", (event) => {
       this.openApprovalModeMenu(event);
     });
+
+    toolbarEl.createDiv({ cls: "codexidian-toolbar-spacer" });
+    this.sendBtn = toolbarEl.createEl("button", { cls: "codexidian-send-btn" });
+    this.sendBtn.type = "button";
+    this.updateSendButton();
 
     this.queueIndicatorEl = footerEl.createDiv({ cls: "codexidian-queue-indicator" });
     this.updateQueueIndicator();
@@ -363,6 +363,7 @@ export class CodexidianView extends ItemView {
     }
     this.updateSkillButtonText();
     this.updateModeButtonText();
+    this.autoResizeInput();
 
     this.bindEvents();
     this.updateStatus();
@@ -421,6 +422,7 @@ export class CodexidianView extends ItemView {
       }
     });
     this.inputEl.addEventListener("input", () => {
+      this.autoResizeInput();
       this.handleSlashInputChanged();
     });
 
@@ -517,7 +519,7 @@ export class CodexidianView extends ItemView {
       this.slashMenu?.registerCommand({
         ...command,
         execute: async () => {
-          this.inputEl.value = "";
+          this.setInputValue("");
           this.slashMenu?.hide();
           await command.execute();
           this.inputEl.focus();
@@ -615,14 +617,14 @@ export class CodexidianView extends ItemView {
   private async executeSelectedSlashCommand(): Promise<void> {
     const executed = await this.slashMenu?.executeSelected();
     if (!executed) return;
-    this.inputEl.value = "";
+    this.setInputValue("");
     this.inputEl.focus();
   }
 
   private async executeSlashCommandByName(name: string): Promise<boolean> {
     const executed = await this.slashMenu?.executeByName(name);
     if (!executed) return false;
-    this.inputEl.value = "";
+    this.setInputValue("");
     this.slashMenu?.hide();
     this.inputEl.focus();
     return true;
@@ -1207,7 +1209,7 @@ export class CodexidianView extends ItemView {
       if (executed) {
         this.debugLog("sendCurrentInput:slash-executed", { slashCommandName });
         if (promptOverride === undefined) {
-          this.inputEl.value = "";
+          this.setInputValue("");
         }
         return;
       }
@@ -1219,7 +1221,7 @@ export class CodexidianView extends ItemView {
         queueLength: this.messageQueue.length,
       });
       if (promptOverride === undefined) {
-        this.inputEl.value = "";
+        this.setInputValue("");
       }
       this.updateQueueIndicator();
       return;
@@ -1246,7 +1248,7 @@ export class CodexidianView extends ItemView {
 
     const cc = tab.conversationController;
     if (promptOverride === undefined) {
-      this.inputEl.value = "";
+      this.setInputValue("");
     }
 
     // Build augmented prompt with context
@@ -2081,7 +2083,7 @@ export class CodexidianView extends ItemView {
             );
           }
 
-          this.inputEl.value = "";
+          this.setInputValue("");
           await this.sendCurrentInput(editedText);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -2349,7 +2351,7 @@ export class CodexidianView extends ItemView {
       }
 
       this.removePanelContentFromMessage(tab.panelEl, messageId);
-      this.inputEl.value = target.content;
+      this.setInputValue(target.content);
       this.inputEl.focus();
 
       try {
@@ -2456,9 +2458,7 @@ export class CodexidianView extends ItemView {
       this.attachBtn.setAttr("title", t("attachImage"));
     }
     this.dropZoneTextEl?.setText(t("dropImagesHere"));
-    this.sendBtn?.setText(t("send"));
-    this.sendBtn?.setAttribute("aria-label", t("send"));
-    this.sendBtn?.setAttribute("title", t("send"));
+    this.updateSendButton();
     this.updateNoteContextToggle();
     this.registerBuiltinSlashCommands();
     this.statusPanel?.refreshLocale();
@@ -2829,6 +2829,25 @@ export class CodexidianView extends ItemView {
     setIcon(button, icon);
     button.setAttribute("aria-label", tooltip);
     button.setAttribute("title", tooltip);
+  }
+
+  private updateSendButton(): void {
+    if (!this.sendBtn) return;
+    setIcon(this.sendBtn, "arrow-up");
+    this.sendBtn.setAttribute("aria-label", t("send"));
+    this.sendBtn.setAttribute("title", t("send"));
+  }
+
+  private autoResizeInput(): void {
+    if (!this.inputEl) return;
+    this.inputEl.style.height = "auto";
+    const newHeight = Math.min(Math.max(this.inputEl.scrollHeight, 80), 300);
+    this.inputEl.style.height = `${newHeight}px`;
+  }
+
+  private setInputValue(value: string): void {
+    this.inputEl.value = value;
+    this.autoResizeInput();
   }
 
   private isValidTabManagerState(state: unknown): state is TabManagerState {

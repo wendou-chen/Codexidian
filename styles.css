@@ -584,6 +584,9 @@
   align-items: center;
   gap: 4px;
 }
+.codexidian-toolbar-spacer {
+  flex: 1;
+}
 .codexidian-toolbar-attach-group {
   margin-left: -4px;
 }
@@ -670,7 +673,7 @@
   align-items: center;
   gap: 8px;
 }
-.codexidian-input-wrap {
+.codexidian-input-wrapper {
   flex: 1;
   position: relative;
 }
@@ -1587,31 +1590,31 @@
 .codexidian-input {
   width: 100%;
   resize: vertical;
-  min-height: 60px;
+  min-height: 80px;
+  max-height: 300px;
   font-size: 13px;
 }
 .codexidian-send-btn {
-  padding: 6px 16px;
-  border-radius: 6px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
   background: var(--interactive-accent);
   color: var(--text-on-accent);
   border: none;
   cursor: pointer;
-  font-size: 13px;
-  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: opacity 0.15s;
   flex-shrink: 0;
 }
 .codexidian-send-btn:hover {
-  background: var(--interactive-accent-hover);
+  opacity: 0.85;
 }
-.codexidian-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.codexidian-hint {
-  font-size: 11px;
-  color: var(--text-muted);
+.codexidian-send-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 /* --- Thinking Animation --- */
