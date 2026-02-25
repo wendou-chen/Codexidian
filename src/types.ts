@@ -54,6 +54,7 @@ export interface CodexidianSettings {
   maxTabs: number;
   enableContextInjection: boolean;
   enableSelectionPolling: boolean;
+  enableReviewPane: boolean;
   enableMcp: boolean;
   mcpEndpoint: string;
   mcpApiKey: string;
@@ -81,6 +82,7 @@ export const DEFAULT_SETTINGS: CodexidianSettings = {
   maxTabs: 5,
   enableContextInjection: true,
   enableSelectionPolling: true,
+  enableReviewPane: false,
   enableMcp: false,
   mcpEndpoint: "http://127.0.0.1:27124",
   mcpApiKey: "",

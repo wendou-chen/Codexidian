@@ -183,10 +183,12 @@ export class CodexidianView extends ItemView {
 
     const statusPanelEl = this.rootEl.createDiv({ cls: "codexidian-status-panel" });
     this.statusPanel = new StatusPanel(statusPanelEl);
-    const reviewPaneEl = this.rootEl.createDiv({ cls: "codexidian-review-pane-host" });
-    this.reviewPane = new ReviewPane(reviewPaneEl, {
-      onCommentsChanged: (comments) => this.handleReviewCommentsChanged(comments),
-    });
+    if (this.plugin.settings.enableReviewPane) {
+      const reviewPaneEl = this.rootEl.createDiv({ cls: "codexidian-review-pane-host" });
+      this.reviewPane = new ReviewPane(reviewPaneEl, {
+        onCommentsChanged: (comments) => this.handleReviewCommentsChanged(comments),
+      });
+    }
 
     // Footer
     const footerEl = this.rootEl.createDiv({ cls: "codexidian-footer" });

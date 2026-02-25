@@ -378,6 +378,10 @@ export default class CodexidianPlugin extends Plugin {
         .filter((pattern) => pattern.length > 0);
     }
 
+    if (typeof this.settings.enableReviewPane !== "boolean") {
+      this.settings.enableReviewPane = DEFAULT_SETTINGS.enableReviewPane;
+    }
+
     this.settings.allowRules = this.normalizeAllowRules(this.settings.allowRules);
 
     if (!Number.isFinite(this.settings.securityMaxNoteSize) || this.settings.securityMaxNoteSize <= 0) {
@@ -873,6 +877,16 @@ class CodexidianSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.enableSelectionPolling).onChange(async (value) => {
           this.plugin.settings.enableSelectionPolling = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName(t("settingEnableReviewPaneName"))
+      .setDesc(t("settingEnableReviewPaneDesc"))
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.enableReviewPane).onChange(async (value) => {
+          this.plugin.settings.enableReviewPane = value;
           await this.plugin.saveSettings();
         }),
       );
