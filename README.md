@@ -1,3 +1,7 @@
+<p align="right">
+  <a href="./README_CN.md">🇨🇳 中文文档</a>
+</p>
+
 # Codexidian
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
