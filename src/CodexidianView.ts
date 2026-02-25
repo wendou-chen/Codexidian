@@ -2493,6 +2493,9 @@ export class CodexidianView extends ItemView {
   }
 
   private appendSystemMessageToPanel(panelEl: HTMLElement, message: string): void {
+    if (this.shouldSuppressSystemMessage(message)) {
+      return;
+    }
     this.appendMessageToPanel(panelEl, "system", message);
   }
 
@@ -2501,6 +2504,14 @@ export class CodexidianView extends ItemView {
     if (tab) {
       this.appendSystemMessageToPanel(tab.panelEl, message);
     }
+  }
+
+  private shouldSuppressSystemMessage(message: string): boolean {
+    const normalized = message.trim();
+    return (
+      normalized.startsWith("[app-server/stderr]")
+      || normalized.startsWith("[app-server/stdout]")
+    );
   }
 
   refreshLocale(): void {
