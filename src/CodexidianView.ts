@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, Menu, normalizePath, Notice, setIcon, TFile, WorkspaceLeaf } from "obsidian";
+﻿import { ItemView, MarkdownView, Menu, normalizePath, Notice, setIcon, TFile, WorkspaceLeaf } from "obsidian";
 
 import type CodexidianPlugin from "./main";
 import type {
@@ -20,11 +20,13 @@ import type {
 } from "./types";
 import {
   APPROVAL_MODES,
-  AVAILABLE_MODELS,
+  CUSTOM_MODEL_OPTION_VALUE,
   EFFORT_OPTIONS,
+  formatTokenWindow,
   type ApprovalMode,
-  type SkillPreset,
   type ThinkingEffort,
+  normalizeContextWindowOverride,
+  normalizeModelOverride,
 } from "./types";
 import { VaultFileAdapter } from "./storage/VaultFileAdapter";
 import { SessionStorage } from "./storage/SessionStorage";
@@ -54,6 +56,9 @@ import { t, tf } from "./i18n";
 
 export const VIEW_TYPE_CODEXIDIAN = "codexidian-view";
 
+const FOLLOW_CLI_MODEL_OPTION_VALUE = "__follow_cli_model__";
+const CLEAR_MODEL_OVERRIDE_OPTION_VALUE = "__clear_model_override__";
+
 interface ReviewTabState {
   diffs: DiffEntry[];
   comments: ReviewComment[];
@@ -77,7 +82,7 @@ export class CodexidianView extends ItemView {
   private sendBtn!: HTMLButtonElement;
   private modelSelect!: HTMLSelectElement;
   private effortSelect!: HTMLSelectElement;
-  private skillMenuBtn!: HTMLButtonElement;
+  private contextUsageBtn: HTMLButtonElement | null = null;
   private modeMenuBtn!: HTMLButtonElement;
   private newThreadBtn!: HTMLButtonElement;
   private restartBtn!: HTMLButtonElement;
@@ -103,12 +108,11 @@ export class CodexidianView extends ItemView {
   private queueIndicatorEl: HTMLElement | null = null;
   private modelLabelEl: HTMLElement | null = null;
   private effortLabelEl: HTMLElement | null = null;
-  private skillLabelEl: HTMLElement | null = null;
   private modeLabelEl: HTMLElement | null = null;
+  private currentTokenEstimate = 0;
   private sendSequence = 0;
   private cancelledSendSequences = new Set<number>();
   private includeCurrentNoteContent = false;
-  private availableSkills: string[] = [];
   private reviewStateByTabId = new Map<string, ReviewTabState>();
   private planStateByTabId = new Map<string, PlanUpdate | null>();
 
@@ -213,13 +217,9 @@ export class CodexidianView extends ItemView {
     const modelGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
     this.modelLabelEl = modelGroup.createSpan({ cls: "codexidian-toolbar-label", text: t("model") });
     this.modelSelect = modelGroup.createEl("select", { cls: "codexidian-toolbar-select" });
-    for (const m of AVAILABLE_MODELS) {
-      const opt = this.modelSelect.createEl("option", { text: m.label, value: m.value });
-      if (m.value === this.plugin.settings.model) opt.selected = true;
-    }
+    this.refreshModelSelectOptions();
     this.modelSelect.addEventListener("change", () => {
-      this.plugin.settings.model = this.modelSelect.value;
-      void this.plugin.saveSettings();
+      void this.handleModelSelection(this.modelSelect.value);
     });
 
     const effortGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
@@ -234,25 +234,21 @@ export class CodexidianView extends ItemView {
       void this.plugin.saveSettings();
     });
 
-    const skillGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
-    this.skillLabelEl = skillGroup.createSpan({ cls: "codexidian-toolbar-label", text: t("skill") });
-    this.skillMenuBtn = skillGroup.createEl("button", {
-      cls: "codexidian-toolbar-select codexidian-toolbar-menu-btn",
-      text: this.getSkillPresetLabel(this.plugin.settings.skillPreset),
-    });
-    this.skillMenuBtn.type = "button";
-    this.skillMenuBtn.addEventListener("click", (event) => {
-      void this.openSkillMenu(event);
-    });
+    // Context usage indicator (replaces Skill selector)
+    this.contextUsageBtn = toolbarEl.createEl("button", { cls: "codexidian-context-usage-btn" });
+    this.contextUsageBtn.type = "button";
+    this.contextUsageBtn.setAttribute("aria-label", "Context Usage");
+    this.contextUsageBtn.addEventListener("click", (e) => this.openContextWindowMenu(e));
+    this.updateContextUsage();
 
     const attachGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group codexidian-toolbar-attach-group" });
     this.attachBtn = attachGroup.createEl("button", {
       cls: "codexidian-attach-btn",
-      text: "📁",
     });
     this.attachBtn.type = "button";
+    setIcon(this.attachBtn, "image");
     this.attachBtn.setAttr("aria-label", t("attachImage"));
-    this.attachBtn.setAttr("title", t("attachImage"));
+    this.attachBtn.removeAttribute("title");
 
     const modeGroup = toolbarEl.createDiv({ cls: "codexidian-toolbar-group" });
     this.modeLabelEl = modeGroup.createSpan({ cls: "codexidian-toolbar-label", text: t("mode") });
@@ -358,16 +354,13 @@ export class CodexidianView extends ItemView {
       }
     }
 
-    try {
-      await this.refreshAvailableSkills();
-    } catch (error) {
-      this.debugError("onOpen:refreshAvailableSkills", error);
-    }
-    this.updateSkillButtonText();
     this.updateModeButtonText();
+    this.refreshContextUsageFromActiveConversation();
     this.autoResizeInput();
 
     this.bindEvents();
+    await this.plugin.refreshResolvedCliConfig({ queueRuntimeReset: false, restartClient: false });
+    this.refreshRuntimeConfigUi();
     this.updateStatus();
   }
 
@@ -558,7 +551,7 @@ export class CodexidianView extends ItemView {
       name: "model",
       label: t("cmdModelLabel"),
       description: t("cmdModelDesc"),
-      icon: "🤖",
+      icon: "🧠",
       execute: async () => {
         await this.cycleModelSetting();
       },
@@ -568,7 +561,7 @@ export class CodexidianView extends ItemView {
       name: "effort",
       label: t("cmdEffortLabel"),
       description: t("cmdEffortDesc"),
-      icon: "🧠",
+      icon: "⚙️",
       execute: async () => {
         await this.cycleEffortSetting();
       },
@@ -588,7 +581,7 @@ export class CodexidianView extends ItemView {
       name: "tabs",
       label: t("cmdTabsLabel"),
       description: t("cmdTabsDesc"),
-      icon: "🗂",
+      icon: "📑",
       execute: () => {
         this.showTabsSummary();
       },
@@ -667,20 +660,110 @@ export class CodexidianView extends ItemView {
     this.setReviewStateForTab(tab.state.tabId, []);
     this.setPlanForTab(tab.state.tabId, null);
     this.reviewPane?.clearComments();
+    this.refreshContextUsageFromActiveConversation();
     new Notice(t("noticeClearedConversation"));
   }
 
-  private async cycleModelSetting(): Promise<void> {
-    const currentValue = this.plugin.settings.model;
-    const currentIndex = AVAILABLE_MODELS.findIndex((model) => model.value === currentValue);
-    const safeIndex = currentIndex >= 0 ? currentIndex : 0;
-    const nextModel = AVAILABLE_MODELS[(safeIndex + 1) % AVAILABLE_MODELS.length];
+  clearActiveConversationThread(systemMessage?: string): void {
+    const tab = this.tabManager?.getActiveTab();
+    if (!tab) {
+      return;
+    }
 
-    this.plugin.settings.model = nextModel.value;
-    this.modelSelect.value = nextModel.value;
-    await this.plugin.saveSettings();
+    const activeConversation = tab.conversationController.getActive();
+    const hadThreadId = Boolean(activeConversation?.threadId || this.plugin.client.getThreadId());
+
+    if (activeConversation) {
+      tab.conversationController.clearThreadId();
+    }
+
+    if (hadThreadId && systemMessage) {
+      this.appendSystemMessageToPanel(tab.panelEl, systemMessage);
+    }
+
+    this.refreshContextUsageFromActiveConversation();
     this.updateStatus();
-    new Notice(tf("noticeModelSet", { model: nextModel.label }));
+  }
+
+  isTurnRunning(): boolean {
+    return this.running;
+  }
+
+  refreshRuntimeConfigUi(): void {
+    this.refreshModelSelectOptions();
+    this.updateContextUsage();
+    this.updateStatus();
+  }
+
+  refreshModelSelectOptions(): void {
+    if (!this.modelSelect) return;
+
+    this.modelSelect.empty();
+    const baselineConfig = this.plugin.getCliBaselineResolvedConfig();
+    const followCliLabel = tf("followCliModel", {
+      model: baselineConfig?.model || t("defaultModel"),
+    });
+    const currentModel = normalizeModelOverride(this.plugin.settings.modelOverride);
+    const hasOverride = currentModel.length > 0;
+
+    if (hasOverride) {
+      const currentOption = this.modelSelect.createEl("option", {
+        text: tf("overrideModelLabel", { model: currentModel }),
+        value: currentModel,
+      });
+      currentOption.selected = true;
+    } else {
+      const followOption = this.modelSelect.createEl("option", {
+        text: followCliLabel,
+        value: FOLLOW_CLI_MODEL_OPTION_VALUE,
+      });
+      followOption.selected = true;
+    }
+
+    if (hasOverride) {
+      this.modelSelect.createEl("option", {
+        text: followCliLabel,
+        value: FOLLOW_CLI_MODEL_OPTION_VALUE,
+      });
+      this.modelSelect.createEl("option", {
+        text: t("clearOverride"),
+        value: CLEAR_MODEL_OVERRIDE_OPTION_VALUE,
+      });
+    }
+
+    this.modelSelect.createEl("option", {
+      text: t("customModelOption"),
+      value: CUSTOM_MODEL_OPTION_VALUE,
+    });
+
+    this.modelSelect.value = hasOverride ? currentModel : FOLLOW_CLI_MODEL_OPTION_VALUE;
+  }
+
+  private async handleModelSelection(value: string): Promise<void> {
+    let nextValue = value;
+    if (value === FOLLOW_CLI_MODEL_OPTION_VALUE || value === CLEAR_MODEL_OVERRIDE_OPTION_VALUE) {
+      nextValue = "";
+    }
+
+    if (value === CUSTOM_MODEL_OPTION_VALUE) {
+      const entered = window.prompt(
+        t("modelPrompt"),
+        this.plugin.settings.modelOverride || this.plugin.getEffectiveModel(),
+      );
+      if (entered === null) {
+        this.refreshModelSelectOptions();
+        return;
+      }
+      nextValue = entered;
+    }
+
+    const normalized = await this.plugin.updateModelOverride(nextValue);
+    this.refreshRuntimeConfigUi();
+    new Notice(tf("noticeModelSet", { model: normalized || this.plugin.getEffectiveModelDisplay() }));
+  }
+
+  private async cycleModelSetting(): Promise<void> {
+    await this.handleModelSelection(CUSTOM_MODEL_OPTION_VALUE);
   }
 
   private async cycleEffortSetting(): Promise<void> {
@@ -697,32 +780,9 @@ export class CodexidianView extends ItemView {
     new Notice(tf("noticeEffortSet", { effort: nextOption.label }));
   }
 
-  private async refreshAvailableSkills(): Promise<void> {
-    try {
-      this.availableSkills = await this.plugin.refreshAvailableSkills();
-    } catch {
-      this.availableSkills = this.plugin.getAvailableSkills();
-    }
-  }
-
-  private getSkillPresetLabel(value: SkillPreset): string {
-    const normalized = value.trim();
-    if (!normalized || normalized === "none") {
-      return t("skillPresetNone");
-    }
-    return normalized;
-  }
-
   private getApprovalModeLabel(value: ApprovalMode): string {
     const found = APPROVAL_MODES.find((mode) => mode.value === value);
     return found?.label ?? "Prompt";
-  }
-
-  private updateSkillButtonText(): void {
-    if (!this.skillMenuBtn) return;
-    const label = this.getSkillPresetLabel(this.plugin.settings.skillPreset);
-    this.skillMenuBtn.setText(label);
-    this.skillMenuBtn.setAttribute("aria-label", `${t("skill")}: ${label}`);
   }
 
   private updateModeButtonText(): void {
@@ -732,36 +792,156 @@ export class CodexidianView extends ItemView {
     this.modeMenuBtn.setAttribute("aria-label", `${t("mode")}: ${label}`);
   }
 
-  private async openSkillMenu(event: MouseEvent): Promise<void> {
-    await this.refreshAvailableSkills();
-    const menu = new Menu();
-    const options: string[] = ["none", ...this.availableSkills];
-    if (
-      this.plugin.settings.skillPreset !== "none"
-      && this.plugin.settings.skillPreset.trim().length > 0
-      && !options.includes(this.plugin.settings.skillPreset)
-    ) {
-      options.push(this.plugin.settings.skillPreset);
+  private estimateTokensFromMessages(messages: ChatMessage[]): number {
+    let totalChars = 0;
+    for (const message of messages) {
+      totalChars += (message.content || "").length;
+    }
+    // Rough estimate for mixed Chinese/English chat content.
+    return Math.round(totalChars / 3);
+  }
+
+  private refreshContextUsageFromActiveConversation(): void {
+    const activeTab = this.tabManager?.getActiveTab();
+    const conv = activeTab?.conversationController?.getActive();
+    if (!conv) {
+      this.currentTokenEstimate = 0;
+      this.updateContextUsage();
+      return;
+    }
+    const messages = conv.messages || [];
+    this.currentTokenEstimate = this.estimateTokensFromMessages(messages);
+    this.updateContextUsage();
+  }
+
+  private updateContextUsage(): void {
+    if (!this.contextUsageBtn) return;
+
+    const maxTokens = this.plugin.getEffectiveContextWindowTokens();
+    const used = this.currentTokenEstimate;
+    const rawPct = (used / maxTokens) * 100;
+    const pct = Math.min(100, used > 0 ? Math.max(1, Math.round(rawPct)) : 0);
+
+    let color = "var(--codexidian-brand)";
+    if (pct >= 80) {
+      color = "#e53e3e";
+    } else if (pct >= 50) {
+      color = "#dd6b20";
     }
 
-    for (const preset of options) {
-      const label = this.getSkillPresetLabel(preset);
+    const radius = 8;
+    const circumference = 2 * Math.PI * radius;
+    const dashoffset = circumference * (1 - pct / 100);
+
+    this.contextUsageBtn.empty();
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("width", "22");
+    svg.setAttribute("height", "22");
+    svg.setAttribute("viewBox", "0 0 22 22");
+    svg.classList.add("codexidian-context-ring");
+
+    const bgCircle = document.createElementNS(SVG_NS, "circle");
+    bgCircle.setAttribute("cx", "11");
+    bgCircle.setAttribute("cy", "11");
+    bgCircle.setAttribute("r", String(radius));
+    bgCircle.setAttribute("fill", "none");
+    bgCircle.setAttribute("stroke", "var(--background-modifier-border)");
+    bgCircle.setAttribute("stroke-width", "2.5");
+    svg.appendChild(bgCircle);
+
+    const progressCircle = document.createElementNS(SVG_NS, "circle");
+    progressCircle.setAttribute("cx", "11");
+    progressCircle.setAttribute("cy", "11");
+    progressCircle.setAttribute("r", String(radius));
+    progressCircle.setAttribute("fill", "none");
+    progressCircle.setAttribute("stroke", color);
+    progressCircle.setAttribute("stroke-width", "2.5");
+    progressCircle.setAttribute("stroke-dasharray", String(circumference));
+    progressCircle.setAttribute("stroke-dashoffset", String(dashoffset));
+    progressCircle.setAttribute("stroke-linecap", "round");
+    progressCircle.setAttribute("transform", "rotate(-90 11 11)");
+    svg.appendChild(progressCircle);
+
+    this.contextUsageBtn.appendChild(svg);
+    this.contextUsageBtn.createEl("span", {
+      cls: "codexidian-context-pct",
+      text: `${pct}%`,
+    });
+    this.contextUsageBtn.createEl("span", {
+      cls: "codexidian-context-size",
+      text: this.plugin.getEffectiveContextWindowDisplay(),
+    });
+
+    const usedK = Math.round(used / 1000);
+    const tooltip = `${t("contextUsage")}: ${usedK}K / ${this.plugin.getEffectiveContextWindowDisplay()} (${this.plugin.getEffectiveContextWindowExactDisplay()})`;
+    this.contextUsageBtn.setAttribute("aria-label", tooltip);
+    this.contextUsageBtn.removeAttribute("title");
+  }
+
+  private openContextWindowMenu(event: MouseEvent): void {
+    const menu = new Menu();
+    const baselineConfig = this.plugin.getCliBaselineResolvedConfig();
+    const followCliWindow = baselineConfig?.contextWindowTokens ?? this.plugin.getEffectiveContextWindowTokens();
+    const currentOverride = normalizeContextWindowOverride(this.plugin.settings.contextWindowOverrideTokens);
+    const isFollowingCli = currentOverride === null;
+
+    menu.addItem((item) => {
+      item.setTitle(`${tf("followCliContextWindow", { size: formatTokenWindow(followCliWindow) })}${isFollowingCli ? " ✓" : ""}`);
+      item.onClick(() => {
+        void (async () => {
+          await this.plugin.updateContextWindowOverride(null);
+          this.refreshRuntimeConfigUi();
+        })();
+      });
+    });
+
+    menu.addItem((item) => {
+      item.setTitle(t("customContextWindowOption"));
+      item.onClick(() => {
+        void (async () => {
+          try {
+            const entered = window.prompt(
+              t("contextWindowPrompt"),
+              String(currentOverride ?? this.plugin.getEffectiveContextWindowTokens()),
+            );
+            if (entered === null) {
+              return;
+            }
+            const normalized = normalizeContextWindowOverride(entered.trim() ? Number(entered.trim()) : null);
+            if (entered.trim().length > 0 && normalized === null) {
+              throw new Error(t("contextWindowInvalid"));
+            }
+            await this.plugin.updateContextWindowOverride(normalized);
+            this.refreshRuntimeConfigUi();
+            new Notice(tf("noticeContextWindowSet", {
+              size: normalized === null
+                ? this.plugin.getEffectiveContextWindowDisplay()
+                : formatTokenWindow(normalized),
+            }));
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(tf("noticeCodexError", { error: message }));
+          }
+        })();
+      });
+    });
+
+    if (!isFollowingCli) {
       menu.addItem((item) => {
-        item.setTitle(label);
-        if (this.plugin.settings.skillPreset === preset) {
-          item.setChecked(true);
-        }
+        item.setTitle(t("clearOverride"));
         item.onClick(() => {
-          this.plugin.settings.skillPreset = preset;
-          this.updateSkillButtonText();
-          void this.plugin.saveSettings();
-          new Notice(tf("noticeSkillSet", { skill: label }));
+          void (async () => {
+            await this.plugin.updateContextWindowOverride(null);
+            this.refreshRuntimeConfigUi();
+          })();
         });
       });
     }
+
     menu.showAtMouseEvent(event);
   }
-
   private openApprovalModeMenu(event: MouseEvent): void {
     const menu = new Menu();
     for (const mode of APPROVAL_MODES) {
@@ -1115,6 +1295,7 @@ export class CodexidianView extends ItemView {
       const message = error instanceof Error ? error.message : String(error);
       this.appendSystemMessageToPanel(tab.panelEl, tf("messageFailedInitConversation", { error: message }));
     }
+    this.refreshContextUsageFromActiveConversation();
     this.appendSystemMessageToPanel(tab.panelEl, t("messageReadyHint"));
   }
 
@@ -1138,6 +1319,7 @@ export class CodexidianView extends ItemView {
       if (conv.threadId) {
         this.plugin.client.setThreadId(conv.threadId);
       }
+      this.refreshContextUsageFromActiveConversation();
     } catch {
       this.tabManager.setConversationId(tab.state.tabId, null);
       await this.ensureConversationReady(tab);
@@ -1150,6 +1332,7 @@ export class CodexidianView extends ItemView {
     this.ensurePlanState(tab.state.tabId);
     this.renderPlanCardForTab(tab.state.tabId);
     this.updateStatus();
+    this.refreshContextUsageFromActiveConversation();
     // Scroll to bottom of active panel
     tab.panelEl.scrollTop = tab.panelEl.scrollHeight;
   }
@@ -1240,6 +1423,8 @@ export class CodexidianView extends ItemView {
       return;
     }
 
+    await this.plugin.prepareForSend();
+
     const conversationReady = await this.ensureConversationReady(tab);
     if (!conversationReady) {
       this.debugLog("sendCurrentInput:abort-conversation-not-ready");
@@ -1318,8 +1503,7 @@ export class CodexidianView extends ItemView {
       }))
       .filter((image) => image.dataUrl.length > 0 || image.path.length > 0);
     const reviewComments = this.consumeReviewCommentsForActiveTab();
-    const promptWithTurnControls = this.buildPromptWithTurnControls(prompt);
-    const promptWithReviewComments = this.appendReviewCommentsToPrompt(promptWithTurnControls, reviewComments);
+    const promptWithReviewComments = this.appendReviewCommentsToPrompt(prompt, reviewComments);
     let augmented = promptWithReviewComments;
     try {
       augmented = buildAugmentedPrompt(promptWithReviewComments, notePath, editorCtx, allContextFiles);
@@ -1330,14 +1514,12 @@ export class CodexidianView extends ItemView {
 
     this.debugLog("sendCurrentInput:prompt-ready", {
       promptLength: prompt.length,
-      promptWithControlsLength: promptWithTurnControls.length,
       promptWithReviewCommentsLength: promptWithReviewComments.length,
       augmentedLength: augmented.length,
       attachedFiles: attachedFiles.length,
       mcpContextFiles: mcpContextFiles.length,
       imageAttachments: imageAttachments.length,
       reviewComments: reviewComments.length,
-      skillPreset: this.plugin.settings.skillPreset,
       approvalMode: this.plugin.settings.approvalMode,
       notePath,
     });
@@ -1360,6 +1542,7 @@ export class CodexidianView extends ItemView {
         : undefined;
       const userMessage = cc.addMessage("user", prompt, { images: userImages });
       this.appendMessageToPanel(tab.panelEl, "user", prompt, userMessage.id, userMessage.images);
+      this.refreshContextUsageFromActiveConversation();
       // Create assistant message element for streaming
       assistantEl = this.createMessageEl(tab.panelEl, "assistant");
     } catch (error) {
@@ -1585,7 +1768,7 @@ export class CodexidianView extends ItemView {
           },
         },
         {
-          model: this.modelSelect.value || undefined,
+          model: this.plugin.getEffectiveModel() || undefined,
           effort: this.effortSelect.value || undefined,
           images: imageInputs.length > 0 ? imageInputs : undefined,
         },
@@ -1638,6 +1821,7 @@ export class CodexidianView extends ItemView {
 
       // Persist assistant message
       cc.addMessage("assistant", accumulated);
+      this.refreshContextUsageFromActiveConversation();
 
       if (result.status !== "completed" && !(cancelledByUser && result.status === "cancelled")) {
         const suffix = result.errorMessage ? `: ${result.errorMessage}` : "";
@@ -1672,6 +1856,7 @@ export class CodexidianView extends ItemView {
         const finalText = accumulated.trim().length > 0 ? accumulated : t("messageCancelledByUser");
         await this.messageRenderer.renderContent(assistantEl, finalText);
         cc.addMessage("assistant", finalText);
+        this.refreshContextUsageFromActiveConversation();
         finalizeThinking();
       } else {
         await this.messageRenderer.renderContent(assistantEl, t("messageNoAssistantOutput"));
@@ -1700,6 +1885,11 @@ export class CodexidianView extends ItemView {
       this.tabBar.setStreaming(tab.state.tabId, false);
       this.statusPanel?.setTurnStatus("idle");
       this.statusPanel?.clearFinishedAfterDelay(3000);
+      try {
+        await this.plugin.applyPendingRuntimeConfigChange();
+      } catch (error) {
+        this.debugError("sendCurrentInput:applyPendingRuntimeConfigChange", error);
+      }
       this.updateStatus();
       try {
         this.fileContext?.clear();
@@ -1713,18 +1903,6 @@ export class CodexidianView extends ItemView {
         new Notice(tf("noticeProcessQueueFailed", { error: message }));
       }
     }
-  }
-
-  private buildPromptWithTurnControls(prompt: string): string {
-    const directives: string[] = [];
-    const skill = this.plugin.settings.skillPreset.trim();
-    if (skill && skill !== "none") {
-      directives.push(`[Skill: ${skill}]`);
-    }
-    if (directives.length === 0) {
-      return prompt;
-    }
-    return `${directives.join("\n")}\n\n${prompt}`;
   }
 
   private appendReviewCommentsToPrompt(prompt: string, comments: ReviewComment[]): string {
@@ -1873,6 +2051,7 @@ export class CodexidianView extends ItemView {
     this.plugin.client.setThreadId(conv.threadId ?? null);
 
     this.updateStatus();
+    this.refreshContextUsageFromActiveConversation();
     tab.panelEl.scrollTop = tab.panelEl.scrollHeight;
   }
 
@@ -1896,6 +2075,7 @@ export class CodexidianView extends ItemView {
     if (ready) {
       this.appendSystemMessageToPanel(activeTab.panelEl, t("messageReadyHint"));
     }
+    this.refreshContextUsageFromActiveConversation();
   }
 
   private async forkConversation(id: string): Promise<void> {
@@ -1938,6 +2118,7 @@ export class CodexidianView extends ItemView {
 
     this.tabManager.switchTo(forkTab.state.tabId);
     this.updateStatus();
+    this.refreshContextUsageFromActiveConversation();
   }
 
   private async renderConversationMessages(panelEl: HTMLElement, messages: ChatMessage[]): Promise<void> {
@@ -2018,7 +2199,7 @@ export class CodexidianView extends ItemView {
 
     const editBtn = actionsEl.createEl("button", {
       cls: "codexidian-msg-action-btn",
-      text: "✏",
+      text: "✏️",
       title: t("editMessageTitle"),
     });
     editBtn.addEventListener("click", (event) => {
@@ -2029,7 +2210,7 @@ export class CodexidianView extends ItemView {
 
     const rewindBtn = actionsEl.createEl("button", {
       cls: "codexidian-msg-action-btn",
-      text: "↩",
+      text: "↩️",
       title: t("rewindTitle"),
     });
     rewindBtn.addEventListener("click", (event) => {
@@ -2413,6 +2594,7 @@ export class CodexidianView extends ItemView {
       this.removePanelContentFromMessage(tab.panelEl, messageId);
       this.setInputValue(target.content);
       this.inputEl.focus();
+      this.refreshContextUsageFromActiveConversation();
 
       try {
         const threadId = await this.plugin.client.newThread();
@@ -2473,6 +2655,7 @@ export class CodexidianView extends ItemView {
 
       this.tabManager.switchTo(forkTab.state.tabId);
       this.updateStatus();
+      this.refreshContextUsageFromActiveConversation();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       new Notice(tf("noticeForkFailed", { error: message }));
@@ -2519,14 +2702,15 @@ export class CodexidianView extends ItemView {
     this.updateHeaderButtons();
     this.inputEl.placeholder = t("askPlaceholder");
     this.modelLabelEl?.setText(t("model"));
+    this.refreshModelSelectOptions();
     this.effortLabelEl?.setText(t("effort"));
-    this.skillLabelEl?.setText(t("skill"));
     this.modeLabelEl?.setText(t("mode"));
-    this.updateSkillButtonText();
     this.updateModeButtonText();
+    this.updateContextUsage();
     if (this.attachBtn) {
+      setIcon(this.attachBtn, "image");
       this.attachBtn.setAttr("aria-label", t("attachImage"));
-      this.attachBtn.setAttr("title", t("attachImage"));
+      this.attachBtn.removeAttribute("title");
     }
     this.dropZoneTextEl?.setText(t("dropImagesHere"));
     this.updateSendButton();
@@ -2590,7 +2774,7 @@ export class CodexidianView extends ItemView {
     }
 
     this.noteContextEl.style.display = "flex";
-    this.noteContextTextEl.setText(`📝 ${this.getFileName(notePath)}`);
+    this.noteContextTextEl.setText(`馃摑 ${this.getFileName(notePath)}`);
     this.noteContextTextEl.title = notePath;
     this.updateContextRowVisibility();
   }
@@ -2868,13 +3052,19 @@ export class CodexidianView extends ItemView {
 
   updateStatus(): void {
     const settings = this.plugin.settings;
+    const resolved = this.plugin.getResolvedCliConfig();
     const threadId = this.plugin.client.getThreadId();
     const connected = this.plugin.client.isRunning();
     const engineText = connected ? t("connected") : t("disconnected");
     const runningText = this.running ? t("running") : t("idle");
     const threadText = threadId ? `${t("thread")} ${threadId.slice(0, 8)}...` : t("noThread");
+    const modelText = this.plugin.getEffectiveModelDisplay();
+    const windowText = this.plugin.getEffectiveContextWindowDisplay();
+    const modelSource = resolved?.modelSource === "override" ? t("sourceOverrideShort") : t("sourceCliShort");
+    const windowSource = resolved?.contextWindowSource === "override" ? t("sourceOverrideShort") : t("sourceCliShort");
+    const pendingText = this.plugin.hasPendingRuntimeRefresh() ? ` | ${t("statusRuntimePending")}` : "";
     this.statusEl.setText(
-      `${engineText} | ${runningText} | ${threadText} | ${settings.model || t("defaultModel")} | ${settings.thinkingEffort} | ${settings.approvalPolicy}`,
+      `${engineText} | ${runningText} | ${threadText} | ${modelText} (${modelSource}) | ${windowText} (${windowSource}) | ${settings.thinkingEffort} | ${settings.approvalPolicy}${pendingText}`,
     );
     this.updateHeaderButtons();
     this.sendBtn.disabled = false;
@@ -3356,3 +3546,4 @@ export class CodexidianView extends ItemView {
     }
   }
 }
+

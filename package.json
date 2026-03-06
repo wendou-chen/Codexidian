@@ -7,6 +7,10 @@
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production"
   },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "string-argv": "^0.3.2"
+  },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "builtin-modules": "^3.3.0",

@@ -69,11 +69,12 @@ All settings are available in `Settings -> Codexidian`.
 
 ### General
 - `Language`: `en` / `zh`
-- `Codex command`: CLI executable used to start app-server
+- `Codex command`: CLI executable used to start app-server; profiles/flags such as `codex -p plus` are respected
 - `Working directory`: root cwd for Codex turns
 
 ### Turn Controls
-- `Model`: model override (or default)
+- `Model`: follows the effective Codex CLI config by default; toolbar/settings overrides are plugin-local only
+- `Context window`: follows the effective Codex CLI config by default and displays the resolved token window
 - `Thinking effort`: `low` / `medium` / `high` / `xhigh`
 - `Skill`: dynamic default skill from `.codex/skills`
 - `Mode`: approval behavior (`Safe`, `Prompt`, `Yolo`)

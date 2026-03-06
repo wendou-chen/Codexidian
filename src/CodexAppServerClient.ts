@@ -1,11 +1,16 @@
 import { ChildProcess, spawn, spawnSync } from "child_process";
 
+import {
+  normalizeContextWindowOverride,
+  normalizeModelOverride,
+} from "./types";
 import type {
   ApprovalDecision,
   ApprovalRequest,
   CodexidianSettings,
   McpToolCallRequest,
   McpToolCallResult,
+  ResolvedCodexCliConfig,
   ToolCompleteInfo,
   ToolStartInfo,
   UserInputRequest,
@@ -66,6 +71,7 @@ export class CodexAppServerClient {
 
   constructor(
     private readonly getSettings: () => CodexidianSettings,
+    private readonly getResolvedCliConfig: () => ResolvedCodexCliConfig | null,
     private readonly getVaultPath: () => string,
     private readonly onThreadIdChanged: (threadId: string) => void,
     private readonly onSystemMessage: (message: string) => void,
@@ -340,9 +346,10 @@ export class CodexAppServerClient {
     });
     const selected = this.selectStartCommand(commandCandidates, env, cwd);
     const command = selected.command;
-    this.activeCommand = command;
+    const launchCommand = this.buildLaunchCommand(command, settings);
+    this.activeCommand = launchCommand;
     this.debugLog("app-server start command", {
-      command,
+      command: launchCommand,
       probe: selected.probe.detail,
       reconnectAttempts: this.reconnectAttempts,
       cwd,
@@ -350,7 +357,7 @@ export class CodexAppServerClient {
 
     let child: ChildProcess;
     try {
-      child = spawn(command, ["app-server", "--listen", "stdio://"], {
+      child = spawn(launchCommand, ["app-server", "--listen", "stdio://"], {
         cwd,
         env,
         shell: process.platform === "win32",
@@ -358,7 +365,7 @@ export class CodexAppServerClient {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.debugError("spawn:throw", error, { command, cwd });
+      this.debugError("spawn:throw", error, { command: launchCommand, cwd });
       this.onSystemMessage(`Failed to spawn Codex app-server: ${message}`);
       this.scheduleReconnect();
       throw error;
@@ -376,14 +383,14 @@ export class CodexAppServerClient {
 
     child.on("error", (error) => {
       const reason = error instanceof Error ? error.message : String(error);
-      this.debugError("spawn:error-event", error, { command, cwd });
-      this.handleProcessTermination(child, `Codex app-server error (${command}): ${reason}`);
+      this.debugError("spawn:error-event", error, { command: launchCommand, cwd });
+      this.handleProcessTermination(child, `Codex app-server error (${launchCommand}): ${reason}`);
     });
 
     child.on("exit", (code, signal) => {
       const reason = signal ? `signal ${signal}` : `${code ?? "unknown"}`;
-      this.debugLog("spawn:exit-event", { command, code, signal: signal ?? null });
-      this.handleProcessTermination(child, `Codex app-server exited (${reason}) [${command}].`);
+      this.debugLog("spawn:exit-event", { command: launchCommand, code, signal: signal ?? null });
+      this.handleProcessTermination(child, `Codex app-server exited (${reason}) [${launchCommand}].`);
     });
 
     try {
@@ -515,7 +522,7 @@ export class CodexAppServerClient {
       try {
         const resumed = await this.request("thread/resume", {
           threadId: savedThreadId,
-          model: settings.model.trim() || null,
+          model: this.getRuntimeModel(settings),
           modelProvider: null,
           cwd: this.resolveCwd(settings),
           approvalPolicy: settings.approvalPolicy,
@@ -548,7 +555,7 @@ export class CodexAppServerClient {
   private async startThread(): Promise<string> {
     const settings = this.getSettings();
     const response = await this.request("thread/start", {
-      model: settings.model.trim() || null,
+      model: this.getRuntimeModel(settings),
       modelProvider: null,
       cwd: this.resolveCwd(settings),
       approvalPolicy: settings.approvalPolicy,
@@ -578,6 +585,36 @@ export class CodexAppServerClient {
       return explicit;
     }
     return this.getVaultPath();
+  }
+
+  private getRuntimeModel(settings: CodexidianSettings): string | null {
+    const resolvedModel = normalizeModelOverride(this.getResolvedCliConfig()?.model);
+    if (resolvedModel) {
+      return resolvedModel;
+    }
+
+    const overrideModel = normalizeModelOverride(settings.modelOverride);
+    return overrideModel || null;
+  }
+
+  private buildLaunchCommand(command: string, settings: CodexidianSettings): string {
+    const extraArgs: string[] = [];
+    const modelOverride = normalizeModelOverride(settings.modelOverride);
+    const contextWindowOverride = normalizeContextWindowOverride(settings.contextWindowOverrideTokens);
+
+    if (modelOverride) {
+      extraArgs.push("-c", `model=${JSON.stringify(modelOverride)}`);
+    }
+
+    if (contextWindowOverride !== null) {
+      extraArgs.push("-c", `model_context_window=${contextWindowOverride}`);
+    }
+
+    if (extraArgs.length === 0) {
+      return command;
+    }
+
+    return `${command} ${extraArgs.join(" ")}`;
   }
 
   private buildTurnStartParams(
@@ -631,7 +668,7 @@ export class CodexAppServerClient {
       cwd: null,
       approvalPolicy: null,
       sandboxPolicy: null,
-      model: options?.model?.trim() || null,
+      model: options?.model?.trim() || this.getRuntimeModel(this.getSettings()),
       effort: options?.effort || null,
       summary: null,
       personality: null,
@@ -1478,18 +1515,21 @@ export class CodexAppServerClient {
     };
 
     const primaryIsCmd = primary.toLowerCase().endsWith(".cmd");
+    const primaryLooksCompound = /\s/.test(primary);
 
     if (process.platform === "win32") {
       pushUnique(primary);
-      if (primaryIsCmd) {
-        pushUnique(primary.slice(0, -4));
-      } else {
-        pushUnique(`${primary}.cmd`);
+      if (!primaryLooksCompound) {
+        if (primaryIsCmd) {
+          pushUnique(primary.slice(0, -4));
+        } else {
+          pushUnique(`${primary}.cmd`);
+        }
       }
       pushUnique("codex.cmd");
       pushUnique("codex");
     } else {
-      if (primaryIsCmd) {
+      if (!primaryLooksCompound && primaryIsCmd) {
         pushUnique(primary.slice(0, -4));
       }
       pushUnique(primary);

@@ -4,8 +4,8 @@ export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never"
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ThinkingEffort = "low" | "medium" | "high" | "xhigh";
 export type ApprovalMode = "safe" | "prompt" | "yolo";
-export type SkillPreset = string;
 export type AllowRuleType = "command" | "file_write" | "tool";
+export type ConfigValueSource = "override" | "command" | "profile" | "config" | "default";
 
 export interface AllowRule {
   id: string;
@@ -14,11 +14,75 @@ export interface AllowRule {
   createdAt: number;
 }
 
-export const AVAILABLE_MODELS = [
-  { value: "", label: "Default (Codex)" },
-  { value: "codex-5.3", label: "Codex 5.3" },
-  { value: "gpt-5.2", label: "GPT 5.2" },
-] as const;
+const LEGACY_MODEL_OVERRIDES = new Set([
+  "codex-5.3",
+  "gpt-5.2",
+  "gpt-5.3-codex",
+]);
+
+const LEGACY_CONTEXT_WINDOW_OPTIONS = new Set([128, 400]);
+
+export const CUSTOM_MODEL_OPTION_VALUE = "__custom_model__";
+
+export function normalizeModelOverride(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (LEGACY_MODEL_OVERRIDES.has(normalized.toLowerCase())) {
+    return "";
+  }
+
+  return normalized;
+}
+
+export function normalizeContextWindowOverride(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  const normalized = Math.round(numeric);
+  if (normalized <= 0) {
+    return null;
+  }
+
+  return normalized;
+}
+
+export function migrateLegacyContextWindowSize(value: unknown): number | null {
+  const normalized = normalizeContextWindowOverride(value);
+  if (normalized === null) {
+    return null;
+  }
+
+  if (LEGACY_CONTEXT_WINDOW_OPTIONS.has(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+export function formatTokenWindow(tokens: number | null | undefined): string {
+  const normalized = normalizeContextWindowOverride(tokens);
+  if (normalized === null) {
+    return "0K";
+  }
+  return `${Math.round(normalized / 1000)}K`;
+}
+
+export function formatExactTokenCount(tokens: number | null | undefined): string {
+  const normalized = normalizeContextWindowOverride(tokens);
+  if (normalized === null) {
+    return "0 tokens";
+  }
+  return `${normalized.toLocaleString("en-US")} tokens`;
+}
 
 export const EFFORT_OPTIONS: { value: ThinkingEffort; label: string }[] = [
   { value: "low", label: "Low" },
@@ -41,9 +105,9 @@ export interface CodexidianSettings {
   locale: Locale;
   codexCommand: string;
   workingDirectory: string;
-  model: string;
+  modelOverride: string;
   thinkingEffort: ThinkingEffort;
-  skillPreset: SkillPreset;
+  contextWindowOverrideTokens: number | null;
   approvalMode: ApprovalMode;
   allowRules: AllowRule[];
   approvalPolicy: ApprovalPolicy;
@@ -65,13 +129,24 @@ export interface CodexidianSettings {
   securityMaxNoteSize: number;
 }
 
+export interface ResolvedCodexCliConfig {
+  configPath: string;
+  profile: string | null;
+  model: string;
+  contextWindowTokens: number;
+  modelSource: ConfigValueSource;
+  contextWindowSource: ConfigValueSource;
+  lastLoadedAt: number;
+  warningMessage?: string | null;
+}
+
 export const DEFAULT_SETTINGS: CodexidianSettings = {
   locale: "zh",
   codexCommand: process.platform === "win32" ? "codex.cmd" : "codex",
   workingDirectory: "",
-  model: "",
+  modelOverride: "",
   thinkingEffort: "medium",
-  skillPreset: "none",
+  contextWindowOverrideTokens: null,
   approvalMode: "prompt",
   allowRules: [],
   approvalPolicy: "on-request",
@@ -86,7 +161,7 @@ export const DEFAULT_SETTINGS: CodexidianSettings = {
   enableMcp: false,
   mcpEndpoint: "http://127.0.0.1:27124",
   mcpApiKey: "",
-  mcpContextNoteLimit: 3,
+  mcpContextNoteLimit: 0,
   securityBlockedPaths: [
     ".obsidian/",
     ".claude/",
